@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dr Bro Vibes — Admin Dashboard</title>
+<style>
+  :root{
+    --black:#0A0A0B; --panel:#131316; --panel2:#1A1A1E; --white:#fff;
+    --muted:#A8A6AC; --teal:#2DD4BF; --coral:#FF5B5B; --gold:#F2B705;
+    --line:rgba(255,255,255,0.10); --line-strong:rgba(255,255,255,0.2);
+  }
+  *{ box-sizing:border-box; }
+  body{ margin:0; background:var(--black); color:#fff; font-family:system-ui,-apple-system,sans-serif; min-height:100vh; }
+  a{ color:inherit; }
+  .hidden{ display:none !important; }
+
+  /* ---------- login ---------- */
+  .login-wrap{ max-width:340px; margin:100px auto; padding:0 20px; }
+  .card{ background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:28px; }
+  label{ display:block; font-size:0.85rem; color:var(--muted); margin-bottom:6px; }
+  input, select, textarea{ width:100%; padding:12px; border-radius:8px; border:1px solid var(--line); background:var(--black); color:#fff; margin-bottom:16px; font-size:0.95rem; font-family:inherit; }
+  textarea{ resize:vertical; min-height:70px; }
+  button{ padding:11px 18px; border-radius:8px; border:none; background:var(--teal); color:#000; font-weight:700; cursor:pointer; font-size:0.9rem; }
+  button.secondary{ background:var(--panel2); color:#fff; border:1px solid var(--line-strong); }
+  button.danger{ background:var(--coral); color:#000; }
+  button:disabled{ opacity:0.5; cursor:not-allowed; }
+  .msg{ margin-top:12px; font-size:0.85rem; }
+  .msg.ok{ color:var(--teal); }
+  .msg.err{ color:var(--coral); }
+
+  /* ---------- app shell ---------- */
+  .app{ display:flex; min-height:100vh; }
+  .sidebar{ width:230px; flex-shrink:0; background:var(--panel); border-right:1px solid var(--line); padding:20px 0; }
+  .sidebar h1{ font-size:1rem; padding:0 20px 16px; margin:0; border-bottom:1px solid var(--line); margin-bottom:10px; }
+  .nav-item{ display:block; padding:10px 20px; font-size:0.88rem; color:var(--muted); cursor:pointer; border-left:3px solid transparent; }
+  .nav-item:hover{ color:#fff; background:var(--panel2); }
+  .nav-item.active{ color:var(--teal); border-left-color:var(--teal); background:var(--panel2); }
+  .nav-group-label{ padding:16px 20px 6px; font-size:0.72rem; text-transform:uppercase; letter-spacing:0.08em; color:var(--muted); }
+  .nav-sub{ padding-left:34px; }
+
+  .main{ flex:1; padding:32px 40px; max-width:1100px; }
+  .main h2{ margin:0 0 6px; font-size:1.4rem; }
+  .main .sub{ color:var(--muted); font-size:0.9rem; margin-bottom:24px; }
+
+  /* ---------- grids / lists ---------- */
+  .grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:14px; margin-top:16px; }
+  .tile{ background:var(--panel); border:1px solid var(--line); border-radius:10px; overflow:hidden; cursor:pointer; }
+  .tile img, .tile video{ width:100%; aspect-ratio:1; object-fit:cover; display:block; }
+  .tile .tile-label{ padding:8px 10px; font-size:0.8rem; }
+  .tile .tile-meta{ padding:0 10px 10px; font-size:0.72rem; color:var(--muted); }
+  .badge{ display:inline-block; padding:2px 8px; border-radius:999px; font-size:0.7rem; font-weight:700; }
+  .badge.public{ background:rgba(45,212,191,0.15); color:var(--teal); }
+  .badge.private{ background:rgba(168,166,172,0.15); color:var(--muted); }
+  .badge.draft{ background:rgba(242,183,5,0.15); color:var(--gold); }
+  .badge.scheduled{ background:rgba(74,158,255,0.15); color:#4A9EFF; }
+  .badge.published{ background:rgba(45,212,191,0.15); color:var(--teal); }
+  .badge.failed, .badge.not_connected{ background:rgba(255,91,91,0.15); color:var(--coral); }
+  .badge.processing, .badge.pending{ background:rgba(255,210,63,0.15); color:#FFD23F; }
+
+  .row-list{ margin-top:16px; }
+  .row-item{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 16px; background:var(--panel); border:1px solid var(--line); border-radius:10px; margin-bottom:8px; cursor:pointer; }
+  .row-item:hover{ border-color:var(--line-strong); }
+  .row-item .title{ font-weight:600; font-size:0.92rem; }
+  .row-item .meta{ font-size:0.78rem; color:var(--muted); }
+  .platform-chips{ display:flex; gap:6px; flex-wrap:wrap; }
+
+  .stat-grid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:14px; margin-top:10px; }
+  .stat{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .stat .num{ font-size:1.6rem; font-weight:800; }
+  .stat .label{ font-size:0.78rem; color:var(--muted); }
+
+  .toolbar{ display:flex; gap:10px; align-items:center; margin-bottom:6px; flex-wrap:wrap; }
+  .tabs{ display:flex; gap:8px; margin-bottom:16px; }
+  .tabs button{ background:var(--panel2); color:var(--muted); border:1px solid var(--line); }
+  .tabs button.active{ background:var(--teal); color:#000; }
+
+  .checkbox-row{ display:flex; align-items:center; gap:8px; margin-bottom:10px; font-size:0.9rem; }
+  .checkbox-row input{ width:auto; margin:0; }
+
+  .modal-backdrop{ position:fixed; inset:0; background:rgba(0,0,0,0.6); display:flex; align-items:center; justify-content:center; z-index:50; }
+  .modal{ background:var(--panel); border:1px solid var(--line-strong); border-radius:14px; padding:26px; max-width:480px; width:92%; max-height:85vh; overflow-y:auto; }
+  .modal h3{ margin-top:0; }
+
+  .close-x{ float:right; cursor:pointer; color:var(--muted); background:none; padding:4px 8px; }
+
+  .empty{ color:var(--muted); font-size:0.88rem; padding:20px 0; }
+</style>
+</head>
+<body>
+
+<!-- ===================== LOGIN ===================== -->
+<div id="loginView" class="login-wrap">
+  <div class="card">
+    <h1 style="margin:0 0 6px;font-size:1.2rem;">Dr Bro Vibes</h1>
+    <p style="color:var(--muted);margin:0 0 20px;font-size:0.85rem;">Admin login</p>
+    <label>Password</label>
+    <input type="password" id="pwInput" placeholder="Enter password">
+    <button onclick="doLogin()" style="width:100%;">Log In</button>
+    <div id="loginMsg" class="msg err"></div>
+  </div>
+</div>
+
+<!-- ===================== APP SHELL ===================== -->
+<div id="app" class="app hidden">
+  <div class="sidebar">
+    <h1>Dr Bro Vibes</h1>
+    <div class="nav-item" data-view="dashboard">Dashboard</div>
+    <div class="nav-group-label">Creator Center</div>
+    <div class="nav-item nav-sub" data-view="create">Create Content</div>
+    <div class="nav-item nav-sub" data-view="media">Media Library</div>
+    <div class="nav-item nav-sub" data-view="galleries">My Galleries</div>
+    <div class="nav-item nav-sub" data-view="posts">Creator Posts</div>
+    <div class="nav-item nav-sub" data-view="videos">Videos</div>
+    <div class="nav-item nav-sub" data-view="drafts">Drafts</div>
+    <div class="nav-item nav-sub" data-view="scheduled">Scheduled</div>
+    <div class="nav-item nav-sub" data-view="published">Published</div>
+    <div class="nav-item nav-sub" data-view="social">Social Publishing</div>
+  </div>
+  <div class="main" id="main"></div>
+</div>
+
+<div id="modalRoot"></div>
+
+<script>
+const API = ""; // same origin
+let TOKEN = localStorage.getItem("drbro_token") || null;
+
+// ---------- auth ----------
+async function doLogin(){
+  const password = document.getElementById("pwInput").value;
+  const msg = document.getElementById("loginMsg");
+  try{
+    const res = await fetch("/api/login", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ password }) });
+    const raw = await res.text();
+    if (!raw){
+      msg.textContent = "The server sent back an empty response. This means the backend Worker code isn't live yet on Cloudflare — double-check Edit Code was actually Deployed (not just Saved), and that the D1/R2/Assets bindings and secrets are set.";
+      return;
+    }
+    let data;
+    try{ data = JSON.parse(raw); } catch(parseErr){
+      msg.textContent = "The server didn't send back valid data (got: " + raw.slice(0,120) + "). The Worker code likely isn't deployed correctly yet.";
+      return;
+    }
+    if (!res.ok){ msg.textContent = data.error || "Login failed."; return; }
+    TOKEN = data.token;
+    localStorage.setItem("drbro_token", TOKEN);
+    showApp();
+  } catch(e){
+    msg.textContent = "Login failed: " + e.message;
+  }
+}
+
+function api(path, opts = {}){
+  opts.headers = Object.assign({}, opts.headers, { Authorization: "Bearer " + TOKEN });
+  return fetch(path, opts).then(async (res) => {
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ("Request failed (" + res.status + ")"));
+    return data;
+  });
+}
+
+function showApp(){
+  document.getElementById("loginView").classList.add("hidden");
+  document.getElementById("app").classList.remove("hidden");
+  navigate("dashboard");
+}
+
+document.querySelectorAll(".nav-item").forEach(el => {
+  el.addEventListener("click", () => navigate(el.dataset.view));
+});
+
+if (TOKEN) showApp();
+
+// ---------- router ----------
+function navigate(view, param){
+  document.querySelectorAll(".nav-item").forEach(el => el.classList.toggle("active", el.dataset.view === view));
+  const main = document.getElementById("main");
+  main.innerHTML = "<p class='empty'>Loading…</p>";
+  const views = {
+    dashboard: renderDashboard,
+    create: renderCreateContent,
+    media: renderMediaLibrary,
+    galleries: renderGalleries,
+    posts: () => renderContentList("post", "Creator Posts"),
+    videos: () => renderContentList("video", "Videos"),
+    drafts: () => renderContentList(null, "Drafts", "draft"),
+    scheduled: () => renderContentList(null, "Scheduled", "scheduled"),
+    published: () => renderContentList(null, "Published", "published"),
+    social: renderSocialPublishing,
+    galleryDetail: () => renderGalleryDetail(param),
+  };
+  (views[view] || renderDashboard)();
+}
+
+function escapeHtml(s){
+  return (s || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+// ---------- dashboard ----------
+async function renderDashboard(){
+  const main = document.getElementById("main");
+  const [media, galleries, drafts, scheduled, published] = await Promise.all([
+    api("/api/media"), api("/api/galleries"),
+    api("/api/content?status=draft"), api("/api/content?status=scheduled"), api("/api/content?status=published"),
+  ]);
+  main.innerHTML = `
+    <h2>Dashboard</h2>
+    <p class="sub">Your Creator Center at a glance.</p>
+    <div class="stat-grid">
+      <div class="stat"><div class="num">${media.media.length}</div><div class="label">Media items</div></div>
+      <div class="stat"><div class="num">${galleries.galleries.length}</div><div class="label">Personal galleries</div></div>
+      <div class="stat"><div class="num">${drafts.content.length}</div><div class="label">Drafts</div></div>
+      <div class="stat"><div class="num">${scheduled.content.length}</div><div class="label">Scheduled</div></div>
+      <div class="stat"><div class="num">${published.content.length}</div><div class="label">Published</div></div>
+    </div>
+    <div style="margin-top:24px;"><button onclick="navigate('create')">+ Create Content</button></div>
+  `;
+}
+
+// ---------- media library ----------
+async function renderMediaLibrary(){
+  const main = document.getElementById("main");
+  const { media } = await api("/api/media");
+  main.innerHTML = `
+    <h2>Media Library</h2>
+    <p class="sub">Every photo/video you've uploaded, stored once. Reuse it in galleries or creator content — no re-uploading.</p>
+    <div class="toolbar">
+      <input type="file" id="libUpload" accept="image/*,video/*" multiple style="width:auto;margin:0;">
+      <button onclick="uploadToLibrary()">Upload</button>
+      <span id="libMsg" class="msg"></span>
+    </div>
+    <div class="grid" id="mediaGrid"></div>
+  `;
+  const gridEl = document.getElementById("mediaGrid");
+  gridEl.innerHTML = media.length ? media.map(mediaTileHtml).join("") : "<p class='empty'>No media yet. Upload your first photo or video above.</p>";
+}
+
+function mediaTileHtml(m){
+  const el = m.media_type === "video" ? `<video src="${m.url}" muted></video>` : `<img src="${m.url}" loading="lazy">`;
+  return `<div class="tile">${el}<div class="tile-label">${escapeHtml(m.original_name || m.media_type)}</div><div class="tile-meta">${m.media_type}</div></div>`;
+}
+
+async function uploadToLibrary(){
+  const input = document.getElementById("libUpload");
+  const msg = document.getElementById("libMsg");
+  if (!input.files.length){ msg.textContent = "Choose a file first."; msg.className = "msg err"; return; }
+  msg.textContent = "Uploading…"; msg.className = "msg";
+  for (const file of input.files){
+    const fd = new FormData();
+    fd.append("file", file);
+    try{
+      await api("/api/media", { method:"POST", body: fd });
+    } catch(e){
+      msg.textContent = "Upload failed: " + e.message; msg.className = "msg err"; return;
+    }
+  }
+  msg.textContent = "Uploaded."; msg.className = "msg ok";
+  renderMediaLibrary();
+}
+
+// ---------- galleries ----------
+async function renderGalleries(){
+  const main = document.getElementById("main");
+  const { galleries } = await api("/api/galleries");
+  main.innerHTML = `
+    <h2>My Galleries</h2>
+    <p class="sub">Personal galleries you create yourself. Private by default — creating one never publishes anything.</p>
+    <button onclick="openCreateGalleryModal()">+ Create Gallery</button>
+    <div class="grid" id="galleryGrid"></div>
+  `;
+  const gridEl = document.getElementById("galleryGrid");
+  gridEl.innerHTML = galleries.length ? galleries.map(galleryTileHtml).join("") : "<p class='empty'>No galleries yet.</p>";
+  gridEl.querySelectorAll(".tile").forEach(el => el.addEventListener("click", () => navigate("galleryDetail", el.dataset.id)));
+}
+
+function galleryTileHtml(g){
+  return `<div class="tile" data-id="${g.id}">
+    <div style="aspect-ratio:1;background:var(--panel2);display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.75rem;">${g.media_count} item${g.media_count===1?'':'s'}</div>
+    <div class="tile-label">${escapeHtml(g.name)}</div>
+    <div class="tile-meta"><span class="badge ${g.visibility}">${g.visibility}</span></div>
+  </div>`;
+}
+
+function openCreateGalleryModal(){
+  renderModal(`
+    <button class="close-x" onclick="closeModal()">✕</button>
+    <h3>Create Gallery</h3>
+    <label>Gallery Name</label>
+    <input id="galName" placeholder="e.g. Mexico 2026">
+    <label>Description (optional)</label>
+    <textarea id="galDesc"></textarea>
+    <label>Visibility</label>
+    <select id="galVis"><option value="private">Private</option><option value="public">Public</option></select>
+    <button onclick="submitCreateGallery()">Create</button>
+    <div id="galMsg" class="msg err"></div>
+  `);
+}
+
+async function submitCreateGallery(){
+  const name = document.getElementById("galName").value.trim();
+  const description = document.getElementById("galDesc").value.trim();
+  const visibility = document.getElementById("galVis").value;
+  const msg = document.getElementById("galMsg");
+  if (!name){ msg.textContent = "Gallery name is required."; return; }
+  try{
+    await api("/api/galleries", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ name, description, visibility }) });
+    closeModal();
+    navigate("galleries");
+  } catch(e){ msg.textContent = e.message; }
+}
+
+async function renderGalleryDetail(id){
+  const main = document.getElementById("main");
+  const { gallery, media } = await api("/api/galleries/" + id);
+  main.innerHTML = `
+    <button class="secondary" onclick="navigate('galleries')">← Back to Galleries</button>
+    <h2 style="margin-top:14px;">${escapeHtml(gallery.name)}</h2>
+    <p class="sub">${escapeHtml(gallery.description || "")} <span class="badge ${gallery.visibility}">${gallery.visibility}</span></p>
+    <div class="toolbar">
+      <button onclick="openAddExistingMediaModal('${gallery.id}')">+ Add Existing Media</button>
+      <button class="secondary" onclick="openRenameGalleryModal('${gallery.id}', '${escapeHtml(gallery.name).replace(/'/g,"\\'")}', '${gallery.visibility}')">Edit</button>
+      <button class="danger" onclick="archiveGallery('${gallery.id}')">Archive</button>
+    </div>
+    <div class="grid" id="galMediaGrid"></div>
+  `;
+  const gridEl = document.getElementById("galMediaGrid");
+  gridEl.innerHTML = media.length ? media.map(m => `
+    <div class="tile">
+      ${m.media_type === "video" ? `<video src="${m.url}" muted></video>` : `<img src="${m.url}" loading="lazy">`}
+      <div class="tile-label">${escapeHtml(m.original_name || "")}</div>
+      <button class="danger" style="width:100%;border-radius:0;" onclick="removeFromGallery('${gallery.id}','${m.id}')">Remove</button>
+    </div>
+  `).join("") : "<p class='empty'>No media in this gallery yet.</p>";
+}
+
+async function removeFromGallery(galleryId, mediaId){
+  await api(`/api/galleries/${galleryId}/media/${mediaId}`, { method:"DELETE" });
+  renderGalleryDetail(galleryId);
+}
+
+async function archiveGallery(galleryId){
+  await api(`/api/galleries/${galleryId}`, { method:"DELETE" });
+  navigate("galleries");
+}
+
+function openRenameGalleryModal(id, name, visibility){
+  renderModal(`
+    <button class="close-x" onclick="closeModal()">✕</button>
+    <h3>Edit Gallery</h3>
+    <label>Gallery Name</label>
+    <input id="editGalName" value="${name}">
+    <label>Visibility</label>
+    <select id="editGalVis"><option value="private" ${visibility==='private'?'selected':''}>Private</option><option value="public" ${visibility==='public'?'selected':''}>Public</option></select>
+    <button onclick="submitEditGallery('${id}')">Save</button>
+  `);
+}
+
+async function submitEditGallery(id){
+  const name = document.getElementById("editGalName").value.trim();
+  const visibility = document.getElementById("editGalVis").value;
+  await api("/api/galleries/" + id, { method:"PATCH", headers:{"content-type":"application/json"}, body: JSON.stringify({ name, visibility }) });
+  closeModal();
+  renderGalleryDetail(id);
+}
+
+async function openAddExistingMediaModal(galleryId){
+  const { media } = await api("/api/media");
+  renderModal(`
+    <button class="close-x" onclick="closeModal()">✕</button>
+    <h3>Add Existing Media</h3>
+    <div class="grid" style="max-height:400px;overflow-y:auto;">
+      ${media.map(m => `<div class="tile" onclick="addExistingMedia('${galleryId}','${m.id}')">${m.media_type==='video'?`<video src="${m.url}" muted></video>`:`<img src="${m.url}">`}</div>`).join("") || "<p class='empty'>No media in your library yet.</p>"}
+    </div>
+  `);
+}
+
+async function addExistingMedia(galleryId, mediaId){
+  await api(`/api/galleries/${galleryId}/media`, { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ media_id: mediaId }) });
+  closeModal();
+  renderGalleryDetail(galleryId);
+}
+
+// ---------- create content ----------
+let selectedMedia = [];
+
+async function renderCreateContent(){
+  selectedMedia = [];
+  const main = document.getElementById("main");
+  main.innerHTML = `
+    <h2>Create Content</h2>
+    <p class="sub">Upload new media or reuse something already in your library. Write once, then choose where it goes.</p>
+
+    <div class="tabs">
+      <button class="active" id="tabUpload" onclick="switchCreateTab('upload')">Upload New</button>
+      <button id="tabExisting" onclick="switchCreateTab('existing')">Use Existing Media</button>
+    </div>
+
+    <div id="uploadPane">
+      <label>Photo or Video</label>
+      <input type="file" id="newMediaFile" accept="image/*,video/*" multiple>
+    </div>
+    <div id="existingPane" class="hidden">
+      <div class="grid" id="pickerGrid" style="max-height:260px;overflow-y:auto;"></div>
+    </div>
+    <div id="selectedPreview" class="grid" style="margin-top:10px;"></div>
+
+    <label style="margin-top:18px;">Content Type</label>
+    <select id="contentType"><option value="post">Post</option><option value="video">Video</option></select>
+
+    <label>Title</label>
+    <input id="cTitle" placeholder="Title">
+    <label>Caption</label>
+    <textarea id="cCaption" placeholder="Caption"></textarea>
+    <label>Description</label>
+    <textarea id="cDesc" placeholder="Description"></textarea>
+
+    <label>Publish to</label>
+    <div class="checkbox-row"><input type="checkbox" value="website" checked> Website</div>
+    <div class="checkbox-row"><input type="checkbox" value="facebook"> Facebook Page</div>
+    <div class="checkbox-row"><input type="checkbox" value="instagram"> Instagram</div>
+    <div class="checkbox-row"><input type="checkbox" value="youtube"> YouTube</div>
+
+    <div class="toolbar" style="margin-top:16px;">
+      <button class="secondary" onclick="submitContent('draft')">Save Draft</button>
+      <button onclick="submitContent('published')">Publish Now</button>
+    </div>
+    <div id="createMsg" class="msg"></div>
+  `;
+  loadPickerGrid();
+}
+
+function switchCreateTab(tab){
+  document.getElementById("tabUpload").classList.toggle("active", tab === "upload");
+  document.getElementById("tabExisting").classList.toggle("active", tab === "existing");
+  document.getElementById("uploadPane").classList.toggle("hidden", tab !== "upload");
+  document.getElementById("existingPane").classList.toggle("hidden", tab !== "existing");
+}
+
+async function loadPickerGrid(){
+  const { media } = await api("/api/media");
+  document.getElementById("pickerGrid").innerHTML = media.map(m => `
+    <div class="tile" onclick="toggleSelectExisting('${m.id}','${m.url}','${m.media_type}')">
+      ${m.media_type==='video'?`<video src="${m.url}" muted></video>`:`<img src="${m.url}">`}
+    </div>`).join("") || "<p class='empty'>No media yet — switch to Upload New.</p>";
+}
+
+function toggleSelectExisting(id, url, type){
+  if (!selectedMedia.find(m => m.id === id)) selectedMedia.push({ id, url, type });
+  renderSelectedPreview();
+}
+
+function renderSelectedPreview(){
+  document.getElementById("selectedPreview").innerHTML = selectedMedia.map(m =>
+    `<div class="tile">${m.type==='video'?`<video src="${m.url}" muted></video>`:`<img src="${m.url}">`}</div>`
+  ).join("");
+}
+
+async function submitContent(status){
+  const msg = document.getElementById("createMsg");
+  msg.textContent = "Working…"; msg.className = "msg";
+
+  // Upload any new files first, add to selectedMedia
+  const fileInput = document.getElementById("newMediaFile");
+  for (const file of fileInput.files){
+    const fd = new FormData();
+    fd.append("file", file);
+    try{
+      const { media } = await api("/api/media", { method:"POST", body: fd });
+      selectedMedia.push({ id: media.id, url: media.url, type: media.media_type });
+    } catch(e){
+      msg.textContent = "Upload failed: " + e.message; msg.className = "msg err"; return;
+    }
+  }
+
+  const platforms = Array.from(document.querySelectorAll(".checkbox-row input:checked")).map(el => el.value);
+  const body = {
+    content_type: document.getElementById("contentType").value,
+    title: document.getElementById("cTitle").value,
+    caption: document.getElementById("cCaption").value,
+    description: document.getElementById("cDesc").value,
+    media_ids: selectedMedia.map(m => m.id),
+    status: status === "published" ? "draft" : "draft", // create as draft, then publish() moves it forward
+    platforms,
+  };
+
+  try{
+    const { content } = await api("/api/content", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify(body) });
+    if (status === "published" && platforms.length){
+      await api(`/api/content/${content.id}/publish`, { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ platforms }) });
+    }
+    msg.textContent = status === "published" ? "Published (see Social Publishing for per-platform status)." : "Draft saved.";
+    msg.className = "msg ok";
+  } catch(e){
+    msg.textContent = e.message; msg.className = "msg err";
+  }
+}
+
+// ---------- content lists (posts/videos/drafts/scheduled/published) ----------
+async function renderContentList(contentType, heading, status){
+  const main = document.getElementById("main");
+  const params = new URLSearchParams();
+  if (status) params.set("status", status);
+  const { content } = await api("/api/content" + (params.toString() ? "?" + params.toString() : ""));
+  const filtered = contentType ? content.filter(c => c.content_type === contentType) : content;
+  main.innerHTML = `
+    <h2>${heading}</h2>
+    <p class="sub">${filtered.length} item${filtered.length===1?'':'s'}</p>
+    <div class="row-list" id="contentRows"></div>
+  `;
+  const rowsEl = document.getElementById("contentRows");
+  rowsEl.innerHTML = filtered.length ? filtered.map(c => `
+    <div class="row-item" onclick="openContentDetail('${c.id}')">
+      <div>
+        <div class="title">${escapeHtml(c.title || "(untitled)")}</div>
+        <div class="meta">${c.content_type} · created ${new Date(c.created_at).toLocaleDateString()}</div>
+      </div>
+      <span class="badge ${c.status}">${c.status}</span>
+    </div>
+  `).join("") : "<p class='empty'>Nothing here yet.</p>";
+}
+
+async function openContentDetail(id){
+  const { content, media, publish_targets } = await api("/api/content/" + id);
+  renderModal(`
+    <button class="close-x" onclick="closeModal()">✕</button>
+    <h3>${escapeHtml(content.title || "(untitled)")}</h3>
+    <p style="color:var(--muted);font-size:0.85rem;">${escapeHtml(content.caption || "")}</p>
+    <div class="grid" style="margin-bottom:16px;">
+      ${media.map(m => m.media_type==='video' ? `<video src="${m.url}" muted controls></video>` : `<img src="${m.url}">`).join("")}
+    </div>
+    <h4 style="margin-bottom:8px;">Publishing Status</h4>
+    <div class="row-list">
+      ${publish_targets.length ? publish_targets.map(t => `
+        <div class="row-item" style="cursor:default;">
+          <div class="title" style="text-transform:capitalize;">${t.platform}</div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span class="badge ${t.status}">${t.status.replace('_',' ')}</span>
+            ${t.status === 'failed' || t.status === 'not_connected' ? `<button class="secondary" onclick="retryPublish('${content.id}','${t.platform}')">Retry</button>` : ''}
+          </div>
+        </div>
+      `).join("") : "<p class='empty'>No publish targets selected.</p>"}
+    </div>
+  `);
+}
+
+async function retryPublish(contentId, platform){
+  await api(`/api/content/${contentId}/retry/${platform}`, { method:"POST" });
+  closeModal();
+  openContentDetail(contentId);
+}
+
+// ---------- social publishing ----------
+async function renderSocialPublishing(){
+  const main = document.getElementById("main");
+  const { connections } = await api("/api/connections");
+  main.innerHTML = `
+    <h2>Social Publishing</h2>
+    <p class="sub">Connection status for each distribution channel. Facebook/Instagram/YouTube require one-time setup (Meta App Review, Google OAuth) before publishing works — see your Content Publishing plan.</p>
+    <div class="row-list">
+      ${connections.map(c => `
+        <div class="row-item" style="cursor:default;">
+          <div class="title" style="text-transform:capitalize;">${c.platform}${c.account_label ? ' — ' + escapeHtml(c.account_label) : ''}</div>
+          <span class="badge ${c.connected ? 'published' : 'not_connected'}">${c.connected ? 'Connected' : 'Not connected'}</span>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+// ---------- modal ----------
+function renderModal(innerHtml){
+  document.getElementById("modalRoot").innerHTML = `<div class="modal-backdrop" onclick="if(event.target===this) closeModal()"><div class="modal">${innerHtml}</div></div>`;
+}
+function closeModal(){
+  document.getElementById("modalRoot").innerHTML = "";
+}
+</script>
+
+</body>
+</html>
