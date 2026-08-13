@@ -94,9 +94,11 @@
   <div class="card">
     <h1 style="margin:0 0 6px;font-size:1.2rem;">Dr Bro Vibes</h1>
     <p style="color:var(--muted);margin:0 0 20px;font-size:0.85rem;">Admin login</p>
-    <label>Password</label>
-    <input type="password" id="pwInput" placeholder="Enter password">
-    <button onclick="doLogin()" style="width:100%;">Log In</button>
+    <form id="loginForm" onsubmit="event.preventDefault(); doLogin(); return false;">
+      <label>Password</label>
+      <input type="password" id="pwInput" placeholder="Enter password" autocomplete="current-password">
+      <button type="submit" style="width:100%;">Log In</button>
+    </form>
     <div id="loginMsg" class="msg err"></div>
   </div>
 </div>
@@ -406,12 +408,19 @@ async function renderCreateContent(){
     <div id="selectedPreview" class="grid" style="margin-top:10px;"></div>
 
     <label style="margin-top:18px;">Content Type</label>
-    <select id="contentType"><option value="post">Post</option><option value="video">Video</option></select>
+    <select id="contentType" onchange="toggleTranscriptField()"><option value="post">Post</option><option value="video">Video</option></select>
 
     <label>Title</label>
     <input id="cTitle" placeholder="Title">
     <label>Caption</label>
     <textarea id="cCaption" placeholder="Caption"></textarea>
+
+    <div id="transcriptWrap" class="hidden">
+      <label>English Transcript</label>
+      <textarea id="cTranscript" placeholder="Type the English transcript of what you signed in this ASL video…"></textarea>
+      <p class="sub" style="margin-top:-6px;">For ASL videos: write out in English what you communicated in sign, so people who don't know ASL can still follow along. This is not auto-generated — you write it yourself. It'll be shown alongside the video and is searchable once published. (AI-assisted ASL→English drafting is on the roadmap — see README — but nothing here auto-publishes an AI-written transcript without your review.)</p>
+    </div>
+
     <label>Description</label>
     <textarea id="cDesc" placeholder="Description"></textarea>
 
@@ -428,6 +437,12 @@ async function renderCreateContent(){
     <div id="createMsg" class="msg"></div>
   `;
   loadPickerGrid();
+  toggleTranscriptField();
+}
+
+function toggleTranscriptField(){
+  const isVideo = document.getElementById("contentType").value === "video";
+  document.getElementById("transcriptWrap").classList.toggle("hidden", !isVideo);
 }
 
 function switchCreateTab(tab){
@@ -474,8 +489,9 @@ async function submitContent(status){
   }
 
   const platforms = Array.from(document.querySelectorAll(".checkbox-row input:checked")).map(el => el.value);
+  const contentType = document.getElementById("contentType").value;
   const body = {
-    content_type: document.getElementById("contentType").value,
+    content_type: contentType,
     title: document.getElementById("cTitle").value,
     caption: document.getElementById("cCaption").value,
     description: document.getElementById("cDesc").value,
@@ -483,6 +499,13 @@ async function submitContent(status){
     status: status === "published" ? "draft" : "draft", // create as draft, then publish() moves it forward
     platforms,
   };
+  if (contentType === "video") {
+    const transcript = document.getElementById("cTranscript").value.trim();
+    if (transcript) {
+      body.transcript = transcript;
+      body.transcript_language = "English";
+    }
+  }
 
   try{
     const { content } = await api("/api/content", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify(body) });
@@ -529,6 +552,10 @@ async function openContentDetail(id){
     <div class="grid" style="margin-bottom:16px;">
       ${media.map(m => m.media_type==='video' ? `<video src="${m.url}" muted controls></video>` : `<img src="${m.url}">`).join("")}
     </div>
+    ${content.transcript ? `
+      <h4 style="margin-bottom:8px;">English Transcript${content.transcript_language && content.transcript_language !== 'English' ? ' (' + escapeHtml(content.transcript_language) + ')' : ''}</h4>
+      <p style="white-space:pre-wrap;margin-bottom:16px;">${escapeHtml(content.transcript)}</p>
+    ` : ""}
     <h4 style="margin-bottom:8px;">Publishing Status</h4>
     <div class="row-list">
       ${publish_targets.length ? publish_targets.map(t => `
