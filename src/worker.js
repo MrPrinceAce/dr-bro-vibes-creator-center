@@ -4,6 +4,35 @@
  * One Media Library (R2 + D1) shared by Personal Galleries and Creator
  * Content. Uploading a file writes exactly one media_library row; galleries
  * and creator content both reference it — nothing is ever re-uploaded.
+ *
+ * Routes:
+ *   POST   /api/login                          { password } -> { token }
+ *
+ *   POST   /api/media                           multipart upload -> media row
+ *   GET    /api/media                           list media library
+ *
+ *   GET    /api/galleries                       list personal galleries
+ *   POST   /api/galleries                       create gallery
+ *   GET    /api/galleries/:id                   gallery detail + ordered media
+ *   PATCH  /api/galleries/:id                   rename/describe/cover/visibility
+ *   DELETE /api/galleries/:id                   archive (soft) or ?hard=1
+ *   POST   /api/galleries/:id/media              { media_id } add existing media
+ *   DELETE /api/galleries/:id/media/:mediaId     remove from gallery
+ *   PUT    /api/galleries/:id/media/reorder      { order: [mediaId,...] }
+ *
+ *   GET    /api/content                         list creator content (?status=)
+ *   POST   /api/content                         create (draft/scheduled/published)
+ *   GET    /api/content/:id                     detail incl. media + publish status
+ *   PATCH  /api/content/:id                     edit title/caption/description/transcript/media
+ *   POST   /api/content/:id/publish             { platforms: [...] } fan-out publish
+ *   POST   /api/content/:id/retry/:platform      retry one failed platform only
+ *   DELETE /api/content/:id                     archive
+ *
+ *   GET    /api/public/galleries                public galleries only
+ *   GET    /api/public/content                  published creator content only
+ *
+ * Everything under /api/* except /api/login and /api/public/* requires a
+ * valid session token (Authorization: Bearer <token>) minted by /api/login.
  */
 
 // ---------- small helpers ----------
@@ -217,10 +246,20 @@ async function handleContentCreate(request, env) {
   const status = body.status && ["draft", "scheduled", "published"].includes(body.status) ? body.status : "draft";
 
   await env.DB.prepare(
-    `INSERT INTO creator_content (id, content_type, title, caption, description, status, scheduled_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO creator_content (id, content_type, title, caption, description, transcript, transcript_language, status, scheduled_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
-    .bind(id, body.content_type, body.title || null, body.caption || null, body.description || null, status, body.scheduled_at || null)
+    .bind(
+      id,
+      body.content_type,
+      body.title || null,
+      body.caption || null,
+      body.description || null,
+      body.transcript || null,
+      body.transcript ? body.transcript_language || "English" : null,
+      status,
+      body.scheduled_at || null
+    )
     .run();
 
   const mediaIds = Array.isArray(body.media_ids) ? body.media_ids : [];
@@ -272,7 +311,7 @@ async function handleContentUpdate(request, env, id) {
   const body = await request.json();
   const fields = [];
   const values = [];
-  for (const key of ["title", "caption", "description", "status", "scheduled_at"]) {
+  for (const key of ["title", "caption", "description", "transcript", "transcript_language", "status", "scheduled_at"]) {
     if (key in body) {
       fields.push(`${key} = ?`);
       values.push(body[key]);
@@ -300,6 +339,10 @@ async function handleContentDelete(env, id) {
 }
 
 // ---------- publishing (adapters) ----------
+// Website always works today. Facebook/Instagram/YouTube are stubbed until
+// Phase 0 credentials (Meta App Review, Google OAuth) exist — see the
+// Content Publishing plan. Swap the body of each function for the real API
+// call once credentials are available; nothing else in this file changes.
 
 async function publishToWebsite(env, content) {
   return { status: "published", platform_url: null, platform_post_id: content.id };
@@ -310,6 +353,7 @@ async function publishToFacebook(env, content) {
   if (!conn || !conn.connected) {
     return { status: "not_connected", error_message: "Facebook Page not connected yet (Phase 0 setup required)." };
   }
+  // TODO: real Graph API call to /{page-id}/photos or resumable video upload.
   return { status: "not_connected", error_message: "Facebook publisher not yet implemented." };
 }
 
@@ -318,6 +362,7 @@ async function publishToInstagram(env, content) {
   if (!conn || !conn.connected) {
     return { status: "not_connected", error_message: "Instagram Business account not connected yet (Phase 0 setup required)." };
   }
+  // TODO: real Graph API container + publish call.
   return { status: "not_connected", error_message: "Instagram publisher not yet implemented." };
 }
 
@@ -326,6 +371,7 @@ async function publishToYouTube(env, content) {
   if (!conn || !conn.connected) {
     return { status: "not_connected", error_message: "YouTube channel not connected yet (Phase 0 setup required)." };
   }
+  // TODO: real resumable upload via YouTube Data API v3.
   return { status: "not_connected", error_message: "YouTube publisher not yet implemented." };
 }
 
@@ -424,10 +470,33 @@ async function handlePublicGalleries(env) {
 }
 
 async function handlePublicContent(env) {
+  // SELECT * includes `transcript` / `transcript_language`, so a published
+  // ASL video's English transcript is already exposed here for the public
+  // site to render alongside the video and for it to be searchable — no
+  // separate endpoint needed. Transcripts only ever reach this table via a
+  // creator explicitly saving/publishing them (see handleContentCreate /
+  // handleContentUpdate); nothing here auto-generates or auto-publishes one.
   const { results } = await env.DB.prepare(
     `SELECT * FROM creator_content WHERE status = 'published' ORDER BY published_at DESC`
   ).all();
-  return json({ content: results });
+
+  // Attach ordered media (the actual video/photo file(s)) to each item so the
+  // public site can render the ASL video itself, not just its metadata.
+  const { results: mediaRows } = await env.DB.prepare(
+    `SELECT cm.creator_content_id, cm.position, m.id, m.url, m.media_type, m.width, m.height, m.duration_sec
+     FROM creator_content_media cm
+     JOIN media_library m ON m.id = cm.media_id
+     ORDER BY cm.position ASC`
+  ).all();
+  const mediaByContent = {};
+  for (const row of mediaRows) {
+    (mediaByContent[row.creator_content_id] ||= []).push({
+      id: row.id, url: row.url, media_type: row.media_type,
+      width: row.width, height: row.height, duration_sec: row.duration_sec,
+    });
+  }
+  const content = results.map((row) => ({ ...row, media: mediaByContent[row.id] || [] }));
+  return json({ content });
 }
 
 async function handleConnectionsList(env) {
@@ -444,14 +513,17 @@ export default {
     const method = request.method;
 
     try {
+      // Serve uploaded media files (public read)
       const mediaMatch = pathname.match(/^\/media\/(.+)$/);
       if (mediaMatch && method === "GET") {
         return handleMediaServe(request, env, mediaMatch[1]);
       }
 
+      // Public, no-auth endpoints
       if (pathname === "/api/public/galleries" && method === "GET") return handlePublicGalleries(env);
       if (pathname === "/api/public/content" && method === "GET") return handlePublicContent(env);
 
+      // Login
       if (pathname === "/api/login" && method === "POST") {
         const body = await request.json();
         if (body.password !== env.ADMIN_PASSWORD) return err("Wrong password.", 401);
@@ -459,6 +531,7 @@ export default {
         return json({ token });
       }
 
+      // Everything else under /api requires auth
       if (pathname.startsWith("/api/")) {
         const authed = await requireAuth(request, env);
         if (!authed) return err("Unauthorized.", 401);
@@ -500,6 +573,7 @@ export default {
       if (m && method === "PATCH") return handleContentUpdate(request, env, m[1]);
       if (m && method === "DELETE") return handleContentDelete(env, m[1]);
 
+      // Fall through to static assets (public site + dashboard shell)
       return env.ASSETS.fetch(request);
     } catch (e) {
       return err(`Server error: ${e.message}`, 500);
