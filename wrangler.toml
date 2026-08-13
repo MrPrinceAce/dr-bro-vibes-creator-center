@@ -1,6 +1,7 @@
 name = "red-bar-2131"
 main = "src/worker.js"
 compatibility_date = "2026-01-01"
+# trigger workers build
 
 # ---- Static site (your existing public pages) ----
 [assets]
