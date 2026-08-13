@@ -46,17 +46,50 @@ CREATE TABLE IF NOT EXISTS gallery_media (
 -- from galleries entirely. A creator_content row never implies anything
 -- about gallery membership, and vice versa.
 CREATE TABLE IF NOT EXISTS creator_content (
-  id            TEXT PRIMARY KEY,          -- uuid
-  content_type  TEXT NOT NULL CHECK (content_type IN ('post','video')),
-  title         TEXT,
-  caption       TEXT,
-  description   TEXT,
+  id                  TEXT PRIMARY KEY,          -- uuid
+  content_type        TEXT NOT NULL CHECK (content_type IN ('post','video')),
+  title               TEXT,
+  caption             TEXT,
+  description         TEXT,
+  -- ASL video support: a creator communicating in American Sign Language
+  -- uploads a video and writes their own English transcript of what they
+  -- signed. This is NOT auto-generated captioning from spoken audio — it is
+  -- a human-authored transcript of a visual ASL message, entered by the
+  -- creator themselves. transcript_language exists so a future AI transcript
+  -- pass (see "Sign Language AI" note below) can tag machine-suggested drafts
+  -- distinctly from creator-authored ones, and so other transcript languages
+  -- can be added later without a schema change.
+  transcript          TEXT,                      -- creator-written English transcript of the ASL video
+  transcript_language TEXT DEFAULT 'English',     -- language of `transcript`; 'English' for now
   status        TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','scheduled','published','archived')),
   scheduled_at  TEXT,                      -- when status = 'scheduled'
   created_at    TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
   published_at  TEXT
 );
+
+-- ---------------------------------------------------------------------------
+-- ROADMAP (not built, architecture intentionally kept open for it):
+-- "Sign Language AI" — future ASL <-> English capability.
+--
+-- Today: creators upload an ASL video and type their own English transcript
+-- by hand (transcript / transcript_language above). No gesture-recognition
+-- or ASL-interpretation AI runs anywhere in this system yet.
+--
+-- Planned, NOT implemented: (1) camera/video -> AI -> English text (real ASL
+-- understanding — hand shape, movement, both hands, body position, facial
+-- expressions, non-manual markers, spatial grammar, and context, not just
+-- "hand gesture recognition"), offered as a drafting aid the creator must
+-- review and correct before anything publishes — an AI-suggested transcript
+-- must never auto-publish without human review; (2) English text -> AI ->
+-- ASL avatar/video output; (3) eventually, using ASL as an input method for
+-- the Creator Center's own UI instead of typing.
+--
+-- Nothing in this schema should be assumed to block that: `transcript` and
+-- `transcript_language` are plain nullable text columns so a later
+-- `transcript_source` ('creator' | 'ai_draft' | 'ai_reviewed') or a separate
+-- `asl_ai_jobs` table can be added without breaking existing rows.
+-- ---------------------------------------------------------------------------
 
 -- Which media items are attached to a piece of creator content (reused from
 -- media_library, never re-uploaded).
