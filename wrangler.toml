@@ -1,0 +1,23 @@
+name = "red-bar-2131"
+main = "src/worker.js"
+compatibility_date = "2026-01-01"
+
+# ---- Static site (your existing public pages) ----
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+# ---- D1 database (structured data: galleries, creator content, publish status) ----
+[[d1_databases]]
+binding = "DB"
+database_name = "dr-bro-vibes-db"
+database_id = "6bf20e4d-2f03-4d20-8ad8-8c3bc8ae5c78"
+
+# ---- R2 bucket (original photo/video files) ----
+[[r2_buckets]]
+binding = "MEDIA_BUCKET"
+bucket_name = "dr-bro-vibes-media"
+
+# ---- Secrets (set with `wrangler secret put NAME`, do NOT put real values here) ----
+# ADMIN_PASSWORD   - your Creator Center login password
+# SESSION_SECRET   - random long string used to sign login session tokens
