@@ -118,6 +118,16 @@
     <div class="nav-item nav-sub" data-view="scheduled">Scheduled</div>
     <div class="nav-item nav-sub" data-view="published">Published</div>
     <div class="nav-item nav-sub" data-view="social">Social Publishing</div>
+    <div class="nav-group-label">Partner Program</div>
+    <div class="nav-item nav-sub" data-view="partnerOverview">Overview</div>
+    <div class="nav-item nav-sub" data-view="partnerApplications">Applications</div>
+    <div class="nav-item nav-sub" data-view="partners">Partners</div>
+    <div class="nav-item nav-sub" data-view="partnerCampaigns">Campaigns</div>
+    <div class="nav-item nav-sub" data-view="partnerConversions">Conversions</div>
+    <div class="nav-item nav-sub" data-view="partnerEarnings">Earnings</div>
+    <div class="nav-item nav-sub" data-view="partnerPayouts">Payouts</div>
+    <div class="nav-item nav-sub" data-view="partnerFraud">Fraud Flags</div>
+    <div class="nav-item nav-sub" data-view="partnerContent">Content Assignments</div>
   </div>
   <div class="main" id="main"></div>
 </div>
@@ -191,6 +201,15 @@ function navigate(view, param){
     published: () => renderContentList(null, "Published", "published"),
     social: renderSocialPublishing,
     galleryDetail: () => renderGalleryDetail(param),
+    partnerOverview: renderPartnerOverview,
+    partnerApplications: renderPartnerApplications,
+    partners: renderPartners,
+    partnerCampaigns: renderPartnerCampaigns,
+    partnerConversions: renderPartnerConversions,
+    partnerEarnings: renderPartnerEarnings,
+    partnerPayouts: renderPartnerPayouts,
+    partnerFraud: renderPartnerFraud,
+    partnerContent: renderPartnerContent,
   };
   (views[view] || renderDashboard)();
 }
@@ -602,6 +621,450 @@ function renderModal(innerHtml){
 function closeModal(){
   document.getElementById("modalRoot").innerHTML = "";
 }
+
+  // ---------- partner program helpers ----------
+  function badgeClass(s){
+    const map = {
+      pending:"pending", pending_review:"pending", processing:"processing",
+      approved:"published", verified:"published", active:"published", paid:"published", completed:"published", reviewed_ok:"published",
+      failed:"failed", rejected:"failed", disputed:"failed", cancelled:"failed", terminated:"failed", flagged:"failed", open:"failed", reviewed_confirmed:"failed", removed:"failed",
+      draft:"draft", requested:"draft",
+      scheduled:"scheduled", submitted:"scheduled",
+    };
+    return map[s] || "pending";
+  }
+  function fmtMoney(n){
+    return "$" + (Math.round((Number(n) || 0) * 100) / 100).toFixed(2);
+  }
+  function fmtDate(s){
+    if (!s) return "";
+    try{ return new Date(s).toLocaleDateString(); } catch(e){ return s; }
+  }
+
+  // ---------- partner overview ----------
+  async function renderPartnerOverview(){
+    const main = document.getElementById("main");
+    const o = await api("/api/admin/partners/overview");
+    main.innerHTML =
+      "<h2>Partner Program Overview</h2>" +
+      "<p class=\"sub\">" + escapeHtml(o.note || "") + "</p>" +
+      "<div class=\"stat-grid\">" +
+      "<div class=\"stat\"><div class=\"num\">" + o.active_partners + "</div><div class=\"label\">Active Partners</div></div>" +
+      "<div class=\"stat\"><div class=\"num\">" + o.pending_applications + "</div><div class=\"label\">Pending Applications</div></div>" +
+      "<div class=\"stat\"><div class=\"num\">" + o.open_fraud_flags + "</div><div class=\"label\">Open Fraud Flags</div></div>" +
+      "<div class=\"stat\"><div class=\"num\">" + fmtMoney(o.pending_earnings_total) + "</div><div class=\"label\">Pending Earnings</div></div>" +
+      "<div class=\"stat\"><div class=\"num\">" + fmtMoney(o.paid_earnings_total) + "</div><div class=\"label\">Paid Out</div></div>" +
+      "<div class=\"stat\"><div class=\"num\">" + o.total_referral_clicks + "</div><div class=\"label\">Referral Clicks</div></div>" +
+      "<div class=\"stat\"><div class=\"num\">" + o.verified_conversions + "</div><div class=\"label\">Verified Conversions</div></div>" +
+      "</div>";
+  }
+
+  // ---------- partner applications ----------
+  async function renderPartnerApplications(){
+    const main = document.getElementById("main");
+    const { applications } = await api("/api/admin/applications");
+    main.innerHTML =
+      "<h2>Partner Applications</h2>" +
+      "<p class=\"sub\">Review applications and approve or reject. Approving creates (or activates) a real partner record.</p>" +
+      "<div class=\"row-list\" id=\"appRows\"></div>";
+    document.getElementById("appRows").innerHTML = applications.length ? applications.map(function(a){
+      return "<div class=\"row-item\" style=\"cursor:default;\"><div>" +
+        "<div class=\"title\">" + escapeHtml(a.applicant_name) + " — " + escapeHtml(a.applicant_email) + "</div>" +
+        "<div class=\"meta\">" + escapeHtml(a.requested_partner_type) + " · applied " + fmtDate(a.created_at) + (a.message ? " · \"" + escapeHtml(a.message) + "\"" : "") + "</div></div>" +
+        "<div style=\"display:flex;gap:8px;align-items:center;\">" +
+        "<span class=\"badge " + badgeClass(a.status) + "\">" + a.status + "</span>" +
+        (a.status === "pending" ? "<button onclick=\"approveApplication('" + a.id + "')\">Approve</button><button class=\"danger\" onclick=\"rejectApplication('" + a.id + "')\">Reject</button>" : "") +
+        "</div></div>";
+    }).join("") : "<p class=\"empty\">No applications yet.</p>";
+  }
+
+  async function approveApplication(id){
+    try{ await api("/api/admin/applications/" + id + "/approve", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({}) }); renderPartnerApplications(); }
+    catch(e){ alert(e.message); }
+  }
+  async function rejectApplication(id){
+    const review_notes = prompt("Optional reason for rejecting:") || "";
+    try{ await api("/api/admin/applications/" + id + "/reject", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ review_notes: review_notes }) }); renderPartnerApplications(); }
+    catch(e){ alert(e.message); }
+  }
+
+  // ---------- partners ----------
+  async function renderPartners(){
+    const main = document.getElementById("main");
+    const { partners } = await api("/api/admin/partners");
+    main.innerHTML =
+      "<h2>Partners</h2>" +
+      "<p class=\"sub\">All affiliates, ambassadors, creators, and paid partners.</p>" +
+      "<button onclick=\"openAddPartnerModal()\">+ Add Partner</button>" +
+      "<div class=\"row-list\" id=\"partnerRows\"></div>";
+    document.getElementById("partnerRows").innerHTML = partners.length ? partners.map(function(p){
+      return "<div class=\"row-item\" onclick=\"openPartnerDetail('" + p.id + "')\"><div>" +
+        "<div class=\"title\">" + escapeHtml(p.name) + " — " + escapeHtml(p.email) + "</div>" +
+        "<div class=\"meta\">" + escapeHtml(p.partner_type) + " · " + escapeHtml(p.level) + " level · code " + escapeHtml(p.referral_code) + "</div></div>" +
+        "<span class=\"badge " + badgeClass(p.status) + "\">" + p.status + "</span></div>";
+    }).join("") : "<p class=\"empty\">No partners yet.</p>";
+  }
+
+  function openAddPartnerModal(){
+    renderModal(
+      "<button class=\"close-x\" onclick=\"closeModal()\">✕</button>" +
+      "<h3>Add Partner</h3>" +
+      "<label>Name</label><input id=\"npName\">" +
+      "<label>Email</label><input id=\"npEmail\" type=\"email\">" +
+      "<label>Partner Type</label><select id=\"npType\"><option value=\"affiliate\">Affiliate</option><option value=\"ambassador\">Ambassador</option><option value=\"creator\">Creator</option><option value=\"paid_partner\">Paid Partner</option><option value=\"vip\">VIP</option></select>" +
+      "<label>Default Commission % (optional)</label><input id=\"npCommission\" type=\"number\" step=\"0.1\">" +
+      "<button onclick=\"submitAddPartner()\">Create</button>" +
+      "<div id=\"npMsg\" class=\"msg err\"></div>"
+      );
+  }
+
+  async function submitAddPartner(){
+    const name = document.getElementById("npName").value.trim();
+    const email = document.getElementById("npEmail").value.trim();
+    const partner_type = document.getElementById("npType").value;
+    const commission = document.getElementById("npCommission").value;
+    const msg = document.getElementById("npMsg");
+    if (!name || !email){ msg.textContent = "Name and email are required."; return; }
+    try{
+      await api("/api/admin/partners", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ name: name, email: email, partner_type: partner_type, status:"active", default_commission_pct: commission ? Number(commission) : null }) });
+      closeModal();
+      renderPartners();
+    } catch(e){ msg.textContent = e.message; }
+  }
+
+  async function openPartnerDetail(id){
+    const d = await api("/api/admin/partners/" + id);
+    const p = d.partner;
+    const linksHtml = d.referral_links.map(function(l){ return "<div class=\"row-item\" style=\"cursor:default;\"><div class=\"title\">/r/" + escapeHtml(l.code) + "</div></div>"; }).join("") || "<p class=\"empty\">No links yet.</p>";
+    const convHtml = d.conversions.map(function(c){ return "<div class=\"row-item\" style=\"cursor:default;\"><div><div class=\"title\">" + escapeHtml(c.conversion_type) + " — " + fmtMoney(c.revenue_amount) + "</div><div class=\"meta\">" + fmtDate(c.occurred_at) + "</div></div><span class=\"badge " + badgeClass(c.status) + "\">" + c.status + "</span></div>"; }).join("") || "<p class=\"empty\">No conversions yet.</p>";
+    const earnHtml = d.earnings.map(function(e){ return "<div class=\"row-item\" style=\"cursor:default;\"><div><div class=\"title\">" + escapeHtml(e.earning_type) + " — " + fmtMoney(e.amount) + "</div><div class=\"meta\">id " + e.id.slice(0,8) + "</div></div><span class=\"badge " + badgeClass(e.status) + "\">" + e.status + "</span></div>"; }).join("") || "<p class=\"empty\">No earnings yet.</p>";
+    const payHtml = d.payouts.map(function(pa){ return "<div class=\"row-item\" style=\"cursor:default;\"><div class=\"title\">" + fmtMoney(pa.amount) + "</div><span class=\"badge " + badgeClass(pa.status) + "\">" + pa.status + "</span></div>"; }).join("") || "<p class=\"empty\">No payouts yet.</p>";
+    const noteHtml = d.notes.map(function(n){ return "<div class=\"row-item\" style=\"cursor:default;\"><div class=\"title\">" + escapeHtml(n.note) + "</div><div class=\"meta\">" + fmtDate(n.created_at) + "</div></div>"; }).join("") || "<p class=\"empty\">No notes yet.</p>";
+    const flagHtml = d.fraud_flags.map(function(f){ return "<div class=\"row-item\" style=\"cursor:default;\"><div><div class=\"title\">" + escapeHtml(f.reason) + "</div><div class=\"meta\">" + fmtDate(f.created_at) + "</div></div><span class=\"badge " + badgeClass(f.status) + "\">" + f.status + "</span></div>"; }).join("") || "<p class=\"empty\">No fraud flags.</p>";
+    renderModal(
+      "<button class=\"close-x\" onclick=\"closeModal()\">✕</button>" +
+      "<h3>" + escapeHtml(p.name) + "</h3>" +
+      "<p class=\"sub\">" + escapeHtml(p.email) + "</p>" +
+      "<label>Status</label><select id=\"pdStatus\"><option value=\"pending\"" + (p.status==="pending"?" selected":"") + ">Pending</option><option value=\"active\"" + (p.status==="active"?" selected":"") + ">Active</option><option value=\"paused\"" + (p.status==="paused"?" selected":"") + ">Paused</option><option value=\"rejected\"" + (p.status==="rejected"?" selected":"") + ">Rejected</option><option value=\"terminated\"" + (p.status==="terminated"?" selected":"") + ">Terminated</option></select>" +
+      "<label>Level</label><select id=\"pdLevel\"><option value=\"new\"" + (p.level==="new"?" selected":"") + ">New</option><option value=\"bronze\"" + (p.level==="bronze"?" selected":"") + ">Bronze</option><option value=\"silver\"" + (p.level==="silver"?" selected":"") + ">Silver</option><option value=\"gold\"" + (p.level==="gold"?" selected":"") + ">Gold</option><option value=\"elite\"" + (p.level==="elite"?" selected":"") + ">Elite</option><option value=\"vip\"" + (p.level==="vip"?" selected":"") + ">VIP</option></select>" +
+      "<button onclick=\"savePartnerEdit('" + p.id + "')\">Save Changes</button>" +
+      "<div id=\"pdMsg\" class=\"msg\"></div>" +
+      "<h4 style=\"margin-top:20px;\">Dashboard Link</h4><p class=\"sub\" style=\"word-break:break-all;\">/partner-dashboard.html?token=" + p.dashboard_token + "</p>" +
+      "<h4>Referral Links</h4>" + linksHtml +
+      "<h4>Conversions</h4>" + convHtml +
+      "<h4>Earnings</h4>" + earnHtml +
+      "<h4>Payouts</h4>" + payHtml +
+      "<h4>Notes</h4>" + noteHtml +
+      "<div style=\"display:flex;gap:8px;margin:8px 0;\"><input id=\"pdNoteInput\" placeholder=\"Add a note\" style=\"margin-bottom:0;\"><button class=\"secondary\" onclick=\"addPartnerNote('" + p.id + "')\">Add</button></div>" +
+      "<h4>Fraud Flags</h4>" + flagHtml
+      );
+  }
+
+  async function savePartnerEdit(id){
+    const status = document.getElementById("pdStatus").value;
+    const level = document.getElementById("pdLevel").value;
+    const msg = document.getElementById("pdMsg");
+    try{
+      await api("/api/admin/partners/" + id, { method:"PATCH", headers:{"content-type":"application/json"}, body: JSON.stringify({ status: status, level: level }) });
+      msg.textContent = "Saved."; msg.className = "msg ok";
+      renderPartners();
+    } catch(e){ msg.textContent = e.message; msg.className = "msg err"; }
+  }
+
+  async function addPartnerNote(id){
+    const input = document.getElementById("pdNoteInput");
+    const note = input.value.trim();
+    if (!note) return;
+    try{ await api("/api/admin/partners/" + id + "/notes", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ note: note }) }); openPartnerDetail(id); }
+    catch(e){ alert(e.message); }
+  }
+
+  // ---------- campaigns ----------
+  async function renderPartnerCampaigns(){
+    const main = document.getElementById("main");
+    const { campaigns } = await api("/api/admin/campaigns");
+    main.innerHTML =
+      "<h2>Campaigns</h2>" +
+      "<p class=\"sub\">Affiliate, ambassador, creator, and paid-partnership campaigns.</p>" +
+      "<button onclick=\"openCreateCampaignModal()\">+ Create Campaign</button>" +
+      "<div class=\"row-list\" id=\"campaignRows\"></div>";
+    document.getElementById("campaignRows").innerHTML = campaigns.length ? campaigns.map(function(c){
+      return "<div class=\"row-item\" onclick=\"openCampaignDetail('" + c.id + "')\"><div>" +
+        "<div class=\"title\">" + escapeHtml(c.name) + "</div>" +
+        "<div class=\"meta\">" + escapeHtml(c.campaign_type) + " · " + escapeHtml(c.commission_type) + "</div></div>" +
+        "<span class=\"badge " + badgeClass(c.status) + "\">" + c.status + "</span></div>";
+    }).join("") : "<p class=\"empty\">No campaigns yet.</p>";
+  }
+
+  function openCreateCampaignModal(){
+    renderModal(
+      "<button class=\"close-x\" onclick=\"closeModal()\">✕</button>" +
+      "<h3>Create Campaign</h3>" +
+      "<label>Name</label><input id=\"ccName\">" +
+      "<label>Description</label><textarea id=\"ccDesc\"></textarea>" +
+      "<label>Type</label><select id=\"ccType\"><option value=\"affiliate\">Affiliate</option><option value=\"paid_partnership\">Paid Partnership</option><option value=\"ambassador\">Ambassador</option><option value=\"creator_content\">Creator Content</option></select>" +
+      "<label>Status</label><select id=\"ccStatus\"><option value=\"draft\">Draft</option><option value=\"open\">Open</option><option value=\"active\">Active</option></select>" +
+      "<label>Commission Type</label><select id=\"ccCommType\"><option value=\"percentage\">Percentage</option><option value=\"fixed_per_referral\">Fixed per referral</option><option value=\"fixed_per_sale\">Fixed per sale</option><option value=\"fixed_payment\">Fixed payment</option><option value=\"custom\">Custom</option></select>" +
+      "<label>Commission Value (% or $ depending on type)</label><input id=\"ccCommValue\" type=\"number\" step=\"0.01\">" +
+      "<label>Fixed Payment Amount (if fixed_payment)</label><input id=\"ccFixed\" type=\"number\" step=\"0.01\">" +
+      "<label>Budget (optional)</label><input id=\"ccBudget\" type=\"number\" step=\"0.01\">" +
+      "<button onclick=\"submitCreateCampaign()\">Create</button>" +
+      "<div id=\"ccMsg\" class=\"msg err\"></div>"
+      );
+  }
+
+  async function submitCreateCampaign(){
+    const msg = document.getElementById("ccMsg");
+    const name = document.getElementById("ccName").value.trim();
+    if (!name){ msg.textContent = "Name is required."; return; }
+    const body = {
+      name: name,
+      description: document.getElementById("ccDesc").value.trim(),
+      campaign_type: document.getElementById("ccType").value,
+      status: document.getElementById("ccStatus").value,
+      commission_type: document.getElementById("ccCommType").value,
+      commission_value: document.getElementById("ccCommValue").value ? Number(document.getElementById("ccCommValue").value) : null,
+      fixed_payment_amount: document.getElementById("ccFixed").value ? Number(document.getElementById("ccFixed").value) : null,
+      budget: document.getElementById("ccBudget").value ? Number(document.getElementById("ccBudget").value) : null,
+    };
+    try{
+      await api("/api/admin/campaigns", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify(body) });
+      closeModal();
+      renderPartnerCampaigns();
+    } catch(e){ msg.textContent = e.message; }
+  }
+
+  async function openCampaignDetail(id){
+    renderModal(
+      "<button class=\"close-x\" onclick=\"closeModal()\">✕</button>" +
+      "<h3>Add Partner to Campaign</h3>" +
+      "<label>Partner ID</label><input id=\"cpPartnerId\" placeholder=\"Paste partner id from the Partners tab\">" +
+      "<button onclick=\"submitAddPartnerToCampaign('" + id + "')\">Add</button>" +
+      "<div id=\"cpMsg\" class=\"msg err\"></div>"
+      );
+  }
+
+  async function submitAddPartnerToCampaign(campaignId){
+    const partner_id = document.getElementById("cpPartnerId").value.trim();
+    const msg = document.getElementById("cpMsg");
+    if (!partner_id){ msg.textContent = "Partner ID is required."; return; }
+    try{
+      await api("/api/admin/campaigns/" + campaignId + "/partners", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ partner_id: partner_id }) });
+      closeModal();
+    } catch(e){ msg.textContent = e.message; }
+  }
+
+  // ---------- conversions ----------
+  async function renderPartnerConversions(){
+    const main = document.getElementById("main");
+    const { conversions } = await api("/api/admin/conversions");
+    main.innerHTML =
+      "<h2>Conversions</h2>" +
+      "<p class=\"sub\">Admin-recorded real referrals/sales. Verifying approves the linked earning; rejecting fails it; flagging opens a fraud flag for review.</p>" +
+      "<button onclick=\"openRecordConversionModal()\">+ Record Conversion</button>" +
+      "<div class=\"row-list\" id=\"convRows\"></div>";
+    document.getElementById("convRows").innerHTML = conversions.length ? conversions.map(function(c){
+      return "<div class=\"row-item\" style=\"cursor:default;\"><div>" +
+        "<div class=\"title\">" + escapeHtml(c.conversion_type.replace("_"," ")) + " — " + fmtMoney(c.revenue_amount) + "</div>" +
+        "<div class=\"meta\">" + fmtDate(c.occurred_at) + (c.reference_id ? " · ref " + escapeHtml(c.reference_id) : "") + "</div></div>" +
+        "<div style=\"display:flex;gap:6px;align-items:center;\"><span class=\"badge " + badgeClass(c.status) + "\">" + c.status.replace("_"," ") + "</span>" +
+        (c.status === "pending_review" ? "<button onclick=\"updateConversion('" + c.id + "','verified')\">Verify</button><button class=\"secondary\" onclick=\"updateConversion('" + c.id + "','rejected')\">Reject</button><button class=\"danger\" onclick=\"flagConversion('" + c.id + "')\">Flag</button>" : "") +
+        "</div></div>";
+    }).join("") : "<p class=\"empty\">No conversions recorded yet.</p>";
+  }
+
+  function openRecordConversionModal(){
+    renderModal(
+      "<button class=\"close-x\" onclick=\"closeModal()\">✕</button>" +
+      "<h3>Record Conversion</h3>" +
+      "<p class=\"sub\">Record a real referral outcome. This is not fabricated data — enter only actual activity.</p>" +
+      "<label>Referral Link ID</label><input id=\"rcLinkId\" placeholder=\"From the partner's Referral Links list\">" +
+      "<label>Conversion Type</label><select id=\"rcType\"><option value=\"signup\">Signup</option><option value=\"ticket_sale\">Ticket Sale</option><option value=\"membership\">Membership</option><option value=\"other_purchase\">Other Purchase</option></select>" +
+      "<label>Reference ID (order/ticket/membership id, optional)</label><input id=\"rcRef\">" +
+      "<label>Revenue Amount</label><input id=\"rcRevenue\" type=\"number\" step=\"0.01\">" +
+      "<button onclick=\"submitConversion()\">Record</button>" +
+      "<div id=\"rcMsg\" class=\"msg err\"></div>"
+      );
+  }
+
+  async function submitConversion(){
+    const msg = document.getElementById("rcMsg");
+    const referral_link_id = document.getElementById("rcLinkId").value.trim();
+    if (!referral_link_id){ msg.textContent = "Referral Link ID is required."; return; }
+    const body = {
+      referral_link_id: referral_link_id,
+      conversion_type: document.getElementById("rcType").value,
+      reference_id: document.getElementById("rcRef").value.trim() || null,
+      revenue_amount: Number(document.getElementById("rcRevenue").value) || 0,
+    };
+    try{
+      await api("/api/admin/conversions", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify(body) });
+      closeModal();
+      renderPartnerConversions();
+    } catch(e){ msg.textContent = e.message; }
+  }
+
+  async function updateConversion(id, status){
+    try{ await api("/api/admin/conversions/" + id, { method:"PATCH", headers:{"content-type":"application/json"}, body: JSON.stringify({ status: status }) }); renderPartnerConversions(); }
+    catch(e){ alert(e.message); }
+  }
+  async function flagConversion(id){
+    const reason = prompt("Reason for flagging this conversion for review:");
+    if (!reason) return;
+    try{ await api("/api/admin/conversions/" + id, { method:"PATCH", headers:{"content-type":"application/json"}, body: JSON.stringify({ status:"flagged", flagged_reason: reason }) }); renderPartnerConversions(); }
+    catch(e){ alert(e.message); }
+  }
+
+  // ---------- earnings ----------
+  async function renderPartnerEarnings(){
+    const main = document.getElementById("main");
+    const { earnings } = await api("/api/admin/earnings");
+    main.innerHTML =
+      "<h2>Earnings</h2>" +
+      "<p class=\"sub\">Earned → Pending → Approved → Processing → Paid. You control every status change.</p>" +
+      "<div class=\"row-list\" id=\"earnRows\"></div>";
+    document.getElementById("earnRows").innerHTML = earnings.length ? earnings.map(function(e){
+      return "<div class=\"row-item\" style=\"cursor:default;\"><div>" +
+        "<div class=\"title\">" + escapeHtml(e.earning_type) + " — " + fmtMoney(e.amount) + "</div>" +
+        "<div class=\"meta\">id " + e.id.slice(0,8) + " · " + fmtDate(e.created_at) + "</div></div>" +
+        "<div style=\"display:flex;gap:6px;align-items:center;\"><span class=\"badge " + badgeClass(e.status) + "\">" + e.status + "</span>" +
+        "<select onchange=\"updateEarningStatus('" + e.id + "', this.value)\"><option value=\"\">Change status…</option><option value=\"pending\">Pending</option><option value=\"approved\">Approved</option><option value=\"processing\">Processing</option><option value=\"paid\">Paid</option><option value=\"disputed\">Disputed</option><option value=\"failed\">Failed</option></select>" +
+        "</div></div>";
+    }).join("") : "<p class=\"empty\">No earnings yet.</p>";
+  }
+
+  async function updateEarningStatus(id, status){
+    if (!status) return;
+    try{ await api("/api/admin/earnings/" + id, { method:"PATCH", headers:{"content-type":"application/json"}, body: JSON.stringify({ status: status }) }); renderPartnerEarnings(); }
+    catch(e){ alert(e.message); }
+  }
+
+  // ---------- payouts ----------
+  async function renderPartnerPayouts(){
+    const main = document.getElementById("main");
+    const { payouts } = await api("/api/admin/payouts");
+    main.innerHTML =
+      "<h2>Payouts</h2>" +
+      "<p class=\"sub\">Batch approved earnings into a payout, then mark it paid once you've actually sent the money.</p>" +
+      "<button onclick=\"openCreatePayoutModal()\">+ Create Payout</button>" +
+      "<div class=\"row-list\" id=\"payoutRows\"></div>";
+    document.getElementById("payoutRows").innerHTML = payouts.length ? payouts.map(function(p){
+      return "<div class=\"row-item\" style=\"cursor:default;\"><div>" +
+        "<div class=\"title\">" + fmtMoney(p.amount) + "</div>" +
+        "<div class=\"meta\">" + fmtDate(p.requested_at) + (p.method ? " · " + escapeHtml(p.method) : "") + "</div></div>" +
+        "<div style=\"display:flex;gap:6px;align-items:center;\"><span class=\"badge " + badgeClass(p.status) + "\">" + p.status + "</span>" +
+        (p.status !== "paid" ? "<button onclick=\"updatePayoutStatus('" + p.id + "','paid')\">Mark Paid</button><button class=\"danger\" onclick=\"updatePayoutStatus('" + p.id + "','failed')\">Mark Failed</button>" : "") +
+        "</div></div>";
+    }).join("") : "<p class=\"empty\">No payouts yet.</p>";
+  }
+
+  function openCreatePayoutModal(){
+    renderModal(
+      "<button class=\"close-x\" onclick=\"closeModal()\">✕</button>" +
+      "<h3>Create Payout</h3>" +
+      "<label>Partner ID</label><input id=\"poPartnerId\">" +
+      "<label>Earning IDs (comma-separated, must be Approved)</label><textarea id=\"poEarningIds\"></textarea>" +
+      "<label>Method (optional)</label><input id=\"poMethod\" placeholder=\"e.g. bank transfer, PayPal\">" +
+      "<button onclick=\"submitCreatePayout()\">Create</button>" +
+      "<div id=\"poMsg\" class=\"msg err\"></div>"
+      );
+  }
+
+  async function submitCreatePayout(){
+    const msg = document.getElementById("poMsg");
+    const partner_id = document.getElementById("poPartnerId").value.trim();
+    const ids = document.getElementById("poEarningIds").value.split(",").map(function(s){ return s.trim(); }).filter(Boolean);
+    if (!partner_id || !ids.length){ msg.textContent = "Partner ID and at least one earning ID are required."; return; }
+    try{
+      await api("/api/admin/payouts", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify({ partner_id: partner_id, earning_ids: ids, method: document.getElementById("poMethod").value.trim() || null }) });
+      closeModal();
+      renderPartnerPayouts();
+    } catch(e){ msg.textContent = e.message; }
+  }
+
+  async function updatePayoutStatus(id, status){
+    try{ await api("/api/admin/payouts/" + id, { method:"PATCH", headers:{"content-type":"application/json"}, body: JSON.stringify({ status: status }) }); renderPartnerPayouts(); }
+    catch(e){ alert(e.message); }
+  }
+
+  // ---------- fraud flags ----------
+  async function renderPartnerFraud(){
+    const main = document.getElementById("main");
+    const { fraud_flags, note } = await api("/api/admin/fraud-flags?status=open");
+    main.innerHTML =
+      "<h2>Fraud Flags</h2>" +
+      "<p class=\"sub\">" + escapeHtml(note || "For review only. Nothing here automatically bans a partner or withholds a payout.") + "</p>" +
+      "<div class=\"row-list\" id=\"flagRows\"></div>";
+    document.getElementById("flagRows").innerHTML = fraud_flags.length ? fraud_flags.map(function(f){
+      return "<div class=\"row-item\" style=\"cursor:default;\"><div>" +
+        "<div class=\"title\">" + escapeHtml(f.reason) + "</div>" +
+        "<div class=\"meta\">" + fmtDate(f.created_at) + "</div></div>" +
+        "<div style=\"display:flex;gap:6px;\"><button onclick=\"reviewFlag('" + f.id + "','reviewed_ok')\">Reviewed — OK</button><button class=\"danger\" onclick=\"reviewFlag('" + f.id + "','reviewed_confirmed')\">Confirmed Issue</button></div>" +
+        "</div>";
+    }).join("") : "<p class=\"empty\">No open fraud flags.</p>";
+  }
+
+  async function reviewFlag(id, status){
+    try{ await api("/api/admin/fraud-flags/" + id, { method:"PATCH", headers:{"content-type":"application/json"}, body: JSON.stringify({ status: status }) }); renderPartnerFraud(); }
+    catch(e){ alert(e.message); }
+  }
+
+  // ---------- content assignments ----------
+  async function renderPartnerContent(){
+    const main = document.getElementById("main");
+    const { content_assignments } = await api("/api/admin/content-assignments");
+    main.innerHTML =
+      "<h2>Content Assignments</h2>" +
+      "<p class=\"sub\">Content deliverables you've requested from partners for a campaign.</p>" +
+      "<button onclick=\"openCreateAssignmentModal()\">+ New Assignment</button>" +
+      "<div class=\"row-list\" id=\"assignRows\"></div>";
+    document.getElementById("assignRows").innerHTML = content_assignments.length ? content_assignments.map(function(a){
+      return "<div class=\"row-item\" style=\"cursor:default;\"><div>" +
+        "<div class=\"title\">" + escapeHtml(a.requirement_label) + "</div>" +
+        "<div class=\"meta\">" + (a.platform ? escapeHtml(a.platform) + " · " : "") + (a.due_at ? "due " + fmtDate(a.due_at) : "") + "</div></div>" +
+        "<div style=\"display:flex;gap:6px;align-items:center;\"><span class=\"badge " + badgeClass(a.status) + "\">" + a.status.replace("_"," ") + "</span>" +
+        "<select onchange=\"updateAssignmentStatus('" + a.id + "', this.value)\"><option value=\"\">Change status…</option><option value=\"approved\">Approved</option><option value=\"revision_requested\">Revision Requested</option><option value=\"rejected\">Rejected</option><option value=\"published\">Published</option></select>" +
+        "</div></div>";
+    }).join("") : "<p class=\"empty\">No content assignments yet.</p>";
+  }
+
+  function openCreateAssignmentModal(){
+    renderModal(
+      "<button class=\"close-x\" onclick=\"closeModal()\">✕</button>" +
+      "<h3>New Content Assignment</h3>" +
+      "<label>Campaign ID</label><input id=\"caCampaignId\">" +
+      "<label>Partner ID</label><input id=\"caPartnerId\">" +
+      "<label>Requirement</label><input id=\"caLabel\" placeholder=\"e.g. 1 Instagram Reel\">" +
+      "<label>Platform (optional)</label><input id=\"caPlatform\">" +
+      "<label>Due Date (optional)</label><input id=\"caDue\" type=\"date\">" +
+      "<button onclick=\"submitCreateAssignment()\">Create</button>" +
+      "<div id=\"caMsg\" class=\"msg err\"></div>"
+      );
+  }
+
+  async function submitCreateAssignment(){
+    const msg = document.getElementById("caMsg");
+    const body = {
+      campaign_id: document.getElementById("caCampaignId").value.trim(),
+      partner_id: document.getElementById("caPartnerId").value.trim(),
+      requirement_label: document.getElementById("caLabel").value.trim(),
+      platform: document.getElementById("caPlatform").value.trim() || null,
+      due_at: document.getElementById("caDue").value || null,
+    };
+    if (!body.campaign_id || !body.partner_id || !body.requirement_label){ msg.textContent = "Campaign ID, Partner ID, and requirement are required."; return; }
+    try{
+      await api("/api/admin/content-assignments", { method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify(body) });
+      closeModal();
+      renderPartnerContent();
+    } catch(e){ msg.textContent = e.message; }
+  }
+
+  async function updateAssignmentStatus(id, status){
+    if (!status) return;
+    try{ await api("/api/admin/content-assignments/" + id, { method:"PATCH", headers:{"content-type":"application/json"}, body: JSON.stringify({ status: status }) }); renderPartnerContent(); }
+    catch(e){ alert(e.message); }
+  }
+  
 </script>
 
 </body>
