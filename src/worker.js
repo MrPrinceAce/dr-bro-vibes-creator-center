@@ -660,6 +660,7 @@ async function handleReferralClick(request, env, code) {
   const ip = request.headers.get("CF-Connecting-IP") || "";
   const ipHash = await hashIp(env, ip);
   await env.DB.prepare("INSERT INTO referral_clicks (id, referral_link_id, ip_hash, user_agent, referer) VALUES (?, ?, ?, ?, ?)").bind(uuid(), link.id, ipHash, request.headers.get("User-Agent") || "", request.headers.get("Referer") || "").run();
+  await checkClickVelocityFraud(env, link, ipHash);
   await env.DB.prepare("UPDATE partners SET last_active_at = datetime('now') WHERE id = ?").bind(link.partner_id).run();
   const dest = link.destination_url && link.destination_url !== "/" ? link.destination_url : "/";
   const headers = new Headers();
@@ -934,6 +935,7 @@ async function handleConversionsAdminCreate(request, env) {
   const id = uuid();
   const revenue = Number(body.revenue_amount) || 0;
   await env.DB.prepare("INSERT INTO referral_conversions (id, referral_link_id, partner_id, campaign_id, conversion_type, reference_id, revenue_amount) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(id, link.id, partner.id, link.campaign_id || null, body.conversion_type, body.reference_id || null, revenue).run();
+  await checkConversionVelocityFraud(env, partner.id, id);
   const conversion = await env.DB.prepare("SELECT * FROM referral_conversions WHERE id = ?").bind(id).first();
   const amount = await computeCommissionAmount(env, campaign, partner, conversion);
   const earningId = uuid();
@@ -955,6 +957,7 @@ async function handleConversionsAdminUpdate(request, env, id) {
   } else if (body.status === "flagged") {
     await env.DB.prepare("INSERT INTO fraud_flags (id, partner_id, referral_conversion_id, reason) VALUES (?, ?, ?, ?)").bind(uuid(), conv.partner_id, id, body.flagged_reason || "Flagged by admin for review.").run();
   }
+  await recalculatePartnerLevel(env, conv.partner_id);
   const row = await env.DB.prepare("SELECT * FROM referral_conversions WHERE id = ?").bind(id).first();
   return json({ conversion: row });
 }
@@ -1123,7 +1126,57 @@ async function handleSetupPartnerSchema(env) {
   return json({ ok: failed.length === 0, total: statements.length, failed: failed.length, results: results });
 }
 
+async function recalculatePartnerLevel(env, partnerId) {
+  const partner = await env.DB.prepare("SELECT * FROM partners WHERE id = ?").bind(partnerId).first();
+  if (!partner) return null;
+  const totals = await env.DB.prepare("SELECT COALESCE(SUM(revenue_amount), 0) AS rev, COUNT(*) AS cnt FROM referral_conversions WHERE partner_id = ? AND status = 'verified'").bind(partnerId).first();
+  const levels = await env.DB.prepare("SELECT * FROM partner_levels ORDER BY sort_order DESC").all();
+  let newLevel = partner.level;
+  for (const lvl of levels.results) {
+    if (totals.rev >= lvl.min_revenue && totals.cnt >= lvl.min_conversions) { newLevel = lvl.level; break; }
+  }
+  if (newLevel !== partner.level) {
+    await env.DB.prepare("UPDATE partners SET level = ?, updated_at = datetime('now') WHERE id = ?").bind(newLevel, partnerId).run();
+    await env.DB.prepare("INSERT INTO partner_notes (id, partner_id, note) VALUES (?, ?, ?)").bind(uuid(), partnerId, "Automatic level update (rule-based, from verified revenue/conversions): " + partner.level + " -> " + newLevel + " (verified revenue $" + totals.rev.toFixed(2) + ", " + totals.cnt + " verified conversions).").run();
+  }
+  return newLevel;
+}
+
+async function checkClickVelocityFraud(env, link, ipHash) {
+  if (!ipHash) return;
+  const since = new Date(Date.now() - 60 * 60 * 1000).toISOString().slice(0, 19).replace("T", " ");
+  const recent = await env.DB.prepare("SELECT COUNT(*) AS c FROM referral_clicks WHERE referral_link_id = ? AND ip_hash = ? AND clicked_at >= ?").bind(link.id, ipHash, since).first();
+  if (recent.c > 20) {
+    const already = await env.DB.prepare("SELECT id FROM fraud_flags WHERE partner_id = ? AND reason LIKE 'Unusually high click volume%' AND status = 'open' AND created_at >= datetime('now', '-1 day')").bind(link.partner_id).first();
+    if (!already) {
+      await env.DB.prepare("INSERT INTO fraud_flags (id, partner_id, reason) VALUES (?, ?, ?)").bind(uuid(), link.partner_id, "Unusually high click volume: " + recent.c + " clicks from one source on referral link '" + link.code + "' within the last hour. Rule-based flag, for review only -- nothing has been blocked or paused.").run();
+    }
+  }
+}
+
+async function checkConversionVelocityFraud(env, partnerId, conversionId) {
+  const recent = await env.DB.prepare("SELECT COUNT(*) AS c FROM referral_conversions WHERE partner_id = ? AND occurred_at >= datetime('now', '-1 hour')").bind(partnerId).first();
+  if (recent.c > 5) {
+    const already = await env.DB.prepare("SELECT id FROM fraud_flags WHERE partner_id = ? AND reason LIKE 'Unusually high conversion volume%' AND status = 'open' AND created_at >= datetime('now', '-1 day')").bind(partnerId).first();
+    if (!already) {
+      await env.DB.prepare("INSERT INTO fraud_flags (id, partner_id, referral_conversion_id, reason) VALUES (?, ?, ?, ?)").bind(uuid(), partnerId, conversionId, "Unusually high conversion volume: " + recent.c + " conversions recorded for this partner within the last hour. Rule-based flag, for review only -- nothing has been blocked or paused.").run();
+    }
+  }
+}
+
+async function handlePartnerLevelsRecalculateAll(env) {
+  const { results } = await env.DB.prepare("SELECT id FROM partners").all();
+  const updates = [];
+  for (const p of results) {
+    const newLevel = await recalculatePartnerLevel(env, p.id);
+    updates.push({ partner_id: p.id, level: newLevel });
+  }
+  return json({ ok: true, count: updates.length, updates: updates });
+}
+
 async function handleAdminPartnerRoutes(request, env, pathname, method) {
+  if (pathname === "/api/admin/partners/recalculate-levels" && method === "POST") return handlePartnerLevelsRecalculateAll(env);
+
   if (pathname === "/api/admin/setup-partner-schema" && method === "POST") return handleSetupPartnerSchema(env);
 
   if (pathname === "/api/admin/partners/overview" && method === "GET") return handlePartnerOverview(env);
