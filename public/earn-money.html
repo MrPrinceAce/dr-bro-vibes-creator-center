@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+  <html lang="en">
+  <head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dr Bro Vibes — Earn Money as a Partner</title>
+  <style>
+  :root{
+  --black:#0A0A0B; --panel:#131316; --panel2:#1A1A1E; --white:#fff;
+  --muted:#A8A6AC; --teal:#2DD4BF; --coral:#FF5B5B; --gold:#F2B705;
+  --line:rgba(255,255,255,0.10); --line-strong:rgba(255,255,255,0.2);
+}
+*{ box-sizing:border-box; }
+body{ margin:0; background:var(--black); color:#fff; font-family:system-ui,-apple-system,sans-serif; min-height:100vh; }
+a{ color:inherit; }
+.hidden{ display:none !important; }
+.wrap{ max-width:920px; margin:0 auto; padding:48px 20px 80px; }
+.hero h1{ font-size:1.9rem; margin:0 0 10px; }
+.hero p{ color:var(--muted); font-size:1rem; max-width:640px; line-height:1.5; }
+.disclaimer{ background:var(--panel); border:1px solid var(--line); border-left:3px solid var(--gold); border-radius:8px; padding:14px 16px; font-size:0.85rem; color:var(--muted); margin:20px 0 34px; line-height:1.5; }
+.section-title{ font-size:1.1rem; margin:36px 0 6px; }
+label{ display:block; font-size:0.85rem; color:var(--muted); margin-bottom:6px; }
+input, select, textarea{ width:100%; padding:12px; border-radius:8px; border:1px solid var(--line); background:var(--panel2); color:#fff; margin-bottom:16px; font-size:0.95rem; font-family:inherit; }
+textarea{ resize:vertical; min-height:70px; }
+button{ padding:11px 18px; border-radius:8px; border:none; background:var(--teal); color:#000; font-weight:700; cursor:pointer; font-size:0.9rem; }
+button.secondary{ background:var(--panel2); color:#fff; border:1px solid var(--line-strong); }
+button:disabled{ opacity:0.5; cursor:not-allowed; }
+.msg{ margin-top:12px; font-size:0.85rem; }
+.msg.ok{ color:var(--teal); }
+.msg.err{ color:var(--coral); }
+.card{ background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:22px; margin-bottom:16px; }
+.card h3{ margin:0 0 6px; font-size:1.05rem; }
+.card .type{ display:inline-block; padding:2px 8px; border-radius:999px; font-size:0.7rem; font-weight:700; background:rgba(45,212,191,0.15); color:var(--teal); text-transform:uppercase; letter-spacing:0.04em; }
+.card .comp{ margin-top:10px; font-size:0.88rem; color:#fff; }
+.card .comp .fine{ display:block; color:var(--muted); font-size:0.78rem; margin-top:4px; }
+.levels-table{ width:100%; border-collapse:collapse; margin-top:10px; font-size:0.85rem; }
+.levels-table th, .levels-table td{ text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); }
+.levels-table th{ color:var(--muted); font-weight:600; font-size:0.75rem; text-transform:uppercase; letter-spacing:0.04em; }
+.empty{ color:var(--muted); font-size:0.88rem; padding:20px 0; }
+.modal-backdrop{ position:fixed; inset:0; background:rgba(0,0,0,0.6); display:flex; align-items:center; justify-content:center; z-index:50; }
+.modal{ background:var(--panel); border:1px solid var(--line-strong); border-radius:14px; padding:26px; max-width:480px; width:92%; max-height:85vh; overflow-y:auto; }
+.modal h3{ margin-top:0; }
+.close-x{ float:right; cursor:pointer; color:var(--muted); background:none; padding:4px 8px; }
+</style>
+  </head>
+  <body>
+
+  <div class="wrap">
+  <div class="hero">
+  <h1>Earn Money as a Dr Bro Vibes Partner</h1>
+  <p>Join as an affiliate, ambassador, creator, or paid partner and get a personal referral link to share. When people you refer buy or sign up, you can earn a commission or a fixed payment, depending on the campaign.</p>
+  </div>
+  <div class="disclaimer" id="disclaimerText">Earnings depend on actual performance: verified referrals, eligible sales, and the specific campaign's compensation terms. This is not guaranteed income and results vary.</div>
+
+  <h2 class="section-title">Open Opportunities</h2>
+  <div id="campaignList"><p class="empty">Loading…</p></div>
+
+  <h2 class="section-title">Partner Levels</h2>
+  <p style="color:var(--muted);font-size:0.85rem;">Levels are based on your verified activity and can change as you refer more. Standard commission shown below; specific campaigns may set their own terms.</p>
+  <table class="levels-table" id="levelsTable"></table>
+
+  <h2 class="section-title">Apply to Become a Partner</h2>
+<div id="applyMsg" class="msg hidden"></div>
+  <div id="applyForm">
+  <label>Your Name</label>
+  <input id="appName" placeholder="Full name">
+  <label>Email</label>
+  <input id="appEmail" type="email" placeholder="you@example.com">
+  <label>Partner Type</label>
+  <select id="appType">
+  <option value="affiliate">Affiliate</option>
+  <option value="ambassador">Ambassador</option>
+  <option value="creator">Creator</option>
+  <option value="paid_partner">Paid Partner</option>
+  <option value="vip">VIP Partner</option>
+  </select>
+  <label>Which opportunity? (optional)</label>
+  <select id="appCampaign"><option value="">General application — not tied to a specific campaign</option></select>
+  <label>Message (optional)</label>
+  <textarea id="appMessage" placeholder="Tell us about your audience or how you'd like to partner with us"></textarea>
+  <button onclick="submitApplication()">Submit Application</button>
+  </div>
+  </div>
+
+  <div id="modalRoot"></div>
+
+  <script>
+  let CAMPAIGNS = [];
+
+function escapeHtml(s){
+  return (s || "").replace(/[&<>"']/g, function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; });
+    }
+
+async function loadEarnMoney(){
+try{
+const res = await fetch("/api/public/earn-money");
+const data = await res.json();
+CAMPAIGNS = data.campaigns || [];
+renderCampaigns();
+renderLevels(data.partner_levels || []);
+if (data.disclaimer) document.getElementById("disclaimerText").textContent = data.disclaimer;
+populateCampaignSelect();
+} catch(e){
+document.getElementById("campaignList").innerHTML = "<p class='empty'>Couldn't load opportunities right now.</p>";
+}
+}
+
+function renderCampaigns(){
+  const el = document.getElementById("campaignList");
+if (!CAMPAIGNS.length){ el.innerHTML = "<p class='empty'>No open opportunities right now — check back soon, or submit a general application below.</p>"; return; }
+el.innerHTML = CAMPAIGNS.map(function(c){
+  return "<div class=\"card\">" +
+    "<span class=\"type\">" + escapeHtml(c.campaign_type.replace("_"," ")) + "</span>" +
+    "<h3>" + escapeHtml(c.name) + "</h3>" +
+    "<p style=\"color:var(--muted);font-size:0.88rem;\">" + escapeHtml(c.description || "") + "</p>" +
+    "<div class=\"comp\">" + escapeHtml(c.compensation_summary || "") + "</div>" +
+    "<div style=\"margin-top:14px;\"><button class=\"secondary\" onclick=\"applyToCampaign('" + c.id + "')\">Apply for this</button></div>" +
+    "</div>";
+}).join("");
+}
+
+function renderLevels(levels){
+  const el = document.getElementById("levelsTable");
+const rows = levels.map(function(l){
+return "<tr><td style=\"text-transform:capitalize;\">" + escapeHtml(l.level) + "</td>" +
+  "<td>$" + l.min_revenue + "+ revenue or " + l.min_conversions + "+ conversions</td>" +
+  "<td>" + (l.commission_pct ? l.commission_pct + "%" : "Individually negotiated") + "</td></tr>";
+}).join("");
+el.innerHTML = "<tr><th>Level</th><th>Requirement</th><th>Standard Commission</th></tr>" + rows;
+}
+
+function populateCampaignSelect(){
+  const sel = document.getElementById("appCampaign");
+CAMPAIGNS.forEach(function(c){
+  const opt = document.createElement("option");
+  opt.value = c.id;
+opt.textContent = c.name;
+sel.appendChild(opt);
+});
+}
+
+function applyToCampaign(campaignId){
+  document.getElementById("appCampaign").value = campaignId;
+document.getElementById("applyForm").scrollIntoView({ behavior: "smooth" });
+}
+
+async function submitApplication(){
+const msg = document.getElementById("applyMsg");
+msg.className = "msg";
+msg.classList.remove("hidden");
+msg.textContent = "Submitting…";
+const body = {
+  applicant_name: document.getElementById("appName").value.trim(),
+    applicant_email: document.getElementById("appEmail").value.trim(),
+    requested_partner_type: document.getElementById("appType").value,
+    campaign_id: document.getElementById("appCampaign").value || null,
+    message: document.getElementById("appMessage").value.trim(),
+    };
+if (!body.applicant_name || !body.applicant_email){
+msg.textContent = "Name and email are required.";
+msg.className = "msg err";
+return;
+}
+try{
+const res = await fetch("/api/public/partner-applications", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+const data = await res.json().catch(function(){ return {}; });
+if (!res.ok) throw new Error(data.error || "Something went wrong.");
+msg.textContent = "Thanks! Your application has been submitted for review. We'll follow up by email.";
+msg.className = "msg ok";
+document.getElementById("applyForm").classList.add("hidden");
+} catch(e){
+msg.textContent = e.message;
+msg.className = "msg err";
+}
+}
+
+loadEarnMoney();
+</script>
+</body>
+</html>
