@@ -1174,7 +1174,198 @@ async function handlePartnerLevelsRecalculateAll(env) {
   return json({ ok: true, count: updates.length, updates: updates });
 }
 
-async function handleAdminPartnerRoutes(request, env, pathname, method) {
+async 
+// ---------- AI Partner Manager / AI Matching / AI Alerts (rule-based, not real ML) ----------
+
+async function handlePartnerInsights(env) {
+  const insights = [];
+  const partnersRes = await env.DB.prepare("SELECT * FROM partners").all();
+  const partners = partnersRes.results || [];
+  const levelsRes = await env.DB.prepare("SELECT * FROM partner_levels ORDER BY sort_order ASC").all();
+  const levels = levelsRes.results || [];
+  const now = Date.now();
+
+  for (const p of partners) {
+    const flagRow = await env.DB.prepare("SELECT COUNT(*) AS c FROM fraud_flags WHERE partner_id = ? AND status = 'open'").bind(p.id).first();
+    if (flagRow && flagRow.c > 0) {
+      insights.push({
+        partner_id: p.id,
+        partner_name: p.name,
+        type: "fraud_review",
+        severity: "high",
+        message: p.name + " has " + flagRow.c + " open fraud flag(s) awaiting admin review. Rule-based flags only -- nothing has been blocked or paused automatically.",
+      });
+    }
+
+    if (p.status === "active") {
+      const lastActive = p.last_active_at ? new Date(p.last_active_at).getTime() : null;
+      const daysSince = lastActive ? Math.floor((now - lastActive) / 86400000) : null;
+      if (daysSince === null || daysSince > 30) {
+        insights.push({
+          partner_id: p.id,
+          partner_name: p.name,
+          type: "inactive",
+          severity: "medium",
+          message: p.name + " has shown no recorded activity" + (daysSince !== null ? (" in " + daysSince + " days") : "") + ". Consider manual outreach -- this is a suggestion only, no message has been sent automatically.",
+        });
+      }
+    }
+
+    const totals = await env.DB.prepare("SELECT COALESCE(SUM(revenue_amount), 0) AS rev, COUNT(*) AS cnt FROM referral_conversions WHERE partner_id = ? AND status = 'verified'").bind(p.id).first();
+    const currentIdx = levels.findIndex(function (l) { return l.level === p.level; });
+    const nextLevel = currentIdx >= 0 ? levels[currentIdx + 1] : null;
+    if (nextLevel && totals) {
+      const revNeeded = nextLevel.min_revenue - totals.rev;
+      const closeToRevenue = revNeeded > 0 && nextLevel.min_revenue > 0 && revNeeded <= nextLevel.min_revenue * 0.2;
+      if (closeToRevenue) {
+        insights.push({
+          partner_id: p.id,
+          partner_name: p.name,
+          type: "near_level_up",
+          severity: "low",
+          message: p.name + " is close to reaching " + nextLevel.level + " level (about $" + revNeeded.toFixed(2) + " more in verified revenue needed). Estimate only, not guaranteed.",
+        });
+      }
+    }
+  }
+
+  const staleAppsRes = await env.DB.prepare("SELECT * FROM partner_applications WHERE status = 'pending' AND created_at <= datetime('now','-7 days')").all();
+  const staleApps = staleAppsRes.results || [];
+  for (const a of staleApps) {
+    insights.push({
+      partner_id: null,
+      application_id: a.id,
+      partner_name: a.applicant_name,
+      type: "stale_application",
+      severity: "medium",
+      message: "Application from " + a.applicant_name + " has been pending review for over 7 days.",
+    });
+  }
+
+  return json({
+    insights: insights,
+    generated_at: new Date().toISOString(),
+    note: "Rule-based insights for admin review only. Nothing here takes automatic action on a partner's behalf.",
+  });
+}
+
+async function handleCampaignMatches(env, campaignId) {
+  const campaign = await env.DB.prepare("SELECT * FROM campaigns WHERE id = ?").bind(campaignId).first();
+  if (!campaign) return err("Campaign not found.", 404);
+
+  const partnersRes = await env.DB.prepare("SELECT * FROM partners WHERE status = 'active'").all();
+  const partners = partnersRes.results || [];
+  const levelsRes = await env.DB.prepare("SELECT * FROM partner_levels").all();
+  const levelWeight = {};
+  (levelsRes.results || []).forEach(function (l) { levelWeight[l.level] = l.sort_order; });
+
+  const haystack = ((campaign.eligibility || "") + " " + (campaign.requirements || "") + " " + (campaign.description || "")).toLowerCase();
+
+  const matches = [];
+  for (const p of partners) {
+    let score = 0;
+    const reasons = [];
+
+    if (p.category && haystack.indexOf(p.category.toLowerCase()) !== -1) {
+      score += 50;
+      reasons.push("category '" + p.category + "' matches campaign eligibility/requirements text");
+    }
+
+    const weight = levelWeight[p.level] || 0;
+    score += weight * 5;
+    if (weight > 0) reasons.push("partner level: " + p.level);
+
+    const convStats = await env.DB.prepare("SELECT COUNT(*) AS cnt FROM referral_conversions WHERE partner_id = ? AND status = 'verified'").bind(p.id).first();
+    const verifiedCount = (convStats && convStats.cnt) || 0;
+    score += Math.min(verifiedCount, 20) * 2;
+    if (verifiedCount > 0) reasons.push(verifiedCount + " verified conversion(s) on record");
+
+    if (score > 0) {
+      matches.push({
+        partner_id: p.id,
+        partner_name: p.name,
+        partner_type: p.partner_type,
+        level: p.level,
+        match_score: score,
+        reasons: reasons,
+      });
+    }
+  }
+
+  matches.sort(function (a, b) { return b.match_score - a.match_score; });
+
+  return json({
+    campaign_id: campaignId,
+    campaign_name: campaign.name,
+    matches: matches.slice(0, 25),
+    note: "Rule-based suggestions ranked by simple scoring (category overlap, partner level, verified performance). Not a guarantee of fit or approval -- admin review is required before inviting any partner to a campaign.",
+  });
+}
+
+async function handleAdminAlerts(env) {
+  const alerts = [];
+
+  const openFlagsRes = await env.DB.prepare(
+    "SELECT f.id, f.partner_id, f.reason, f.created_at, p.name AS partner_name FROM fraud_flags f LEFT JOIN partners p ON p.id = f.partner_id WHERE f.status = 'open' ORDER BY f.created_at DESC LIMIT 50"
+  ).all();
+  (openFlagsRes.results || []).forEach(function (f) {
+    alerts.push({
+      type: "fraud_flag_open",
+      severity: "high",
+      message: "Open fraud flag for " + (f.partner_name || "unknown partner") + ": " + f.reason,
+      entity_id: f.id,
+      created_at: f.created_at,
+    });
+  });
+
+  const staleAppsRes2 = await env.DB.prepare(
+    "SELECT id, applicant_name, created_at FROM partner_applications WHERE status = 'pending' AND created_at <= datetime('now','-7 days') ORDER BY created_at ASC LIMIT 50"
+  ).all();
+  (staleAppsRes2.results || []).forEach(function (a) {
+    alerts.push({
+      type: "stale_application",
+      severity: "medium",
+      message: "Application from " + a.applicant_name + " has been pending for over 7 days.",
+      entity_id: a.id,
+      created_at: a.created_at,
+    });
+  });
+
+  const endingSoonRes = await env.DB.prepare(
+    "SELECT id, name, ends_at FROM campaigns WHERE status = 'active' AND ends_at IS NOT NULL AND ends_at <= datetime('now','+7 days') AND ends_at >= datetime('now') ORDER BY ends_at ASC LIMIT 50"
+  ).all();
+  (endingSoonRes.results || []).forEach(function (c) {
+    alerts.push({
+      type: "campaign_ending_soon",
+      severity: "low",
+      message: "Campaign '" + c.name + "' ends on " + c.ends_at + ".",
+      entity_id: c.id,
+      created_at: c.ends_at,
+    });
+  });
+
+  const recentLevelChangesRes = await env.DB.prepare(
+    "SELECT pn.id, pn.partner_id, pn.note, pn.created_at, p.name AS partner_name FROM partner_notes pn LEFT JOIN partners p ON p.id = pn.partner_id WHERE pn.note LIKE 'Automatic level update%' AND pn.created_at >= datetime('now','-7 days') ORDER BY pn.created_at DESC LIMIT 50"
+  ).all();
+  (recentLevelChangesRes.results || []).forEach(function (n) {
+    alerts.push({
+      type: "level_change",
+      severity: "low",
+      message: (n.partner_name || "A partner") + ": " + n.note,
+      entity_id: n.partner_id,
+      created_at: n.created_at,
+    });
+  });
+
+  alerts.sort(function (a, b) { return new Date(b.created_at || 0) - new Date(a.created_at || 0); });
+
+  return json({
+    alerts: alerts,
+    generated_at: new Date().toISOString(),
+    note: "Rule-based alert feed for admin awareness only. No automated actions are taken as a result of these alerts.",
+  });
+}
+function handleAdminPartnerRoutes(request, env, pathname, method) {
   if (pathname === "/api/admin/partners/recalculate-levels" && method === "POST") return handlePartnerLevelsRecalculateAll(env);
 
   if (pathname === "/api/admin/setup-partner-schema" && method === "POST") return handleSetupPartnerSchema(env);
@@ -1218,5 +1409,10 @@ async function handleAdminPartnerRoutes(request, env, pathname, method) {
   if (pathname === "/api/admin/content-assignments" && method === "POST") return handleContentAssignmentsAdminCreate(request, env);
   m = pathname.match(/^\/api\/admin\/content-assignments\/([^/]+)$/);
   if (m && method === "PATCH") return handleContentAssignmentsAdminUpdate(request, env, m[1]);
-  return null;
+  
+  if (pathname === "/api/admin/ai/partner-insights" && method === "GET") return handlePartnerInsights(env);
+  if (pathname === "/api/admin/ai/alerts" && method === "GET") return handleAdminAlerts(env);
+  m = pathname.match(/^\/api\/admin\/ai\/campaign-matches\/([^/]+)$/);
+  if (m && method === "GET") return handleCampaignMatches(env, m[1]);
+return null;
 }
