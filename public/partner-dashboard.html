@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+  <html lang="en">
+  <head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dr Bro Vibes — Partner Dashboard</title>
+<style>
+:root{
+--black:#0A0A0B; --panel:#131316; --panel2:#1A1A1E; --white:#fff;
+  --muted:#A8A6AC; --teal:#2DD4BF; --coral:#FF5B5B; --gold:#F2B705;
+  --line:rgba(255,255,255,0.10); --line-strong:rgba(255,255,255,0.2);
+}
+*{ box-sizing:border-box; }
+body{ margin:0; background:var(--black); color:#fff; font-family:system-ui,-apple-system,sans-serif; min-height:100vh; }
+a{ color:inherit; }
+.hidden{ display:none !important; }
+.wrap{ max-width:960px; margin:0 auto; padding:40px 20px 80px; }
+h1{ font-size:1.5rem; margin:0 0 4px; }
+.sub{ color:var(--muted); font-size:0.9rem; margin-bottom:20px; }
+.disclaimer{ background:var(--panel); border:1px solid var(--line); border-left:3px solid var(--gold); border-radius:8px; padding:14px 16px; font-size:0.82rem; color:var(--muted); margin:16px 0 28px; line-height:1.5; }
+.section-title{ font-size:1.05rem; margin:32px 0 10px; }
+.stat-grid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:14px; margin-top:10px; }
+.stat{ background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+.stat .num{ font-size:1.5rem; font-weight:800; }
+.stat .label{ font-size:0.75rem; color:var(--muted); }
+.card{ background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px; margin-bottom:12px; }
+.row-list{ margin-top:10px; }
+.row-item{ display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 16px; background:var(--panel); border:1px solid var(--line); border-radius:10px; margin-bottom:8px; }
+.row-item .title{ font-weight:600; font-size:0.9rem; }
+.row-item .meta{ font-size:0.76rem; color:var(--muted); }
+.badge{ display:inline-block; padding:2px 8px; border-radius:999px; font-size:0.7rem; font-weight:700; }
+.badge.pending{ background:rgba(255,210,63,0.15); color:#FFD23F; }
+.badge.approved, .badge.paid, .badge.verified, .badge.active{ background:rgba(45,212,191,0.15); color:var(--teal); }
+.badge.processing{ background:rgba(74,158,255,0.15); color:#4A9EFF; }
+.badge.rejected, .badge.failed, .badge.disputed, .badge.flagged{ background:rgba(255,91,91,0.15); color:var(--coral); }
+input, select, textarea, button{ font-family:inherit; }
+input, select, textarea{ width:100%; padding:10px; border-radius:8px; border:1px solid var(--line); background:var(--panel2); color:#fff; margin-bottom:10px; font-size:0.9rem; }
+button{ padding:9px 16px; border-radius:8px; border:none; background:var(--teal); color:#000; font-weight:700; cursor:pointer; font-size:0.85rem; }
+button.secondary{ background:var(--panel2); color:#fff; border:1px solid var(--line-strong); }
+.msg{ margin-top:10px; font-size:0.82rem; }
+.msg.ok{ color:var(--teal); }
+.msg.err{ color:var(--coral); }
+.empty{ color:var(--muted); font-size:0.86rem; padding:16px 0; }
+.copy-row{ display:flex; gap:8px; align-items:center; }
+.copy-row input{ margin-bottom:0; }
+</style>
+  </head>
+  <body>
+
+  <div class="wrap">
+  <div id="noTokenView" class="hidden">
+  <h1>Partner Dashboard</h1>
+  <p class="sub">This link is missing your partner access token. Use the personal dashboard link Dr Bro Vibes sent you.</p>
+  </div>
+
+  <div id="loadingView">
+  <p class="sub">Loading your dashboard…</p>
+</div>
+
+<div id="dashView" class="hidden">
+<h1 id="partnerName">Partner Dashboard</h1>
+  <p class="sub" id="partnerMeta"></p>
+  <div class="disclaimer" id="disclaimerText">Earnings depend on actual performance: verified referrals, eligible sales, and the specific campaign's compensation terms. This is not guaranteed income.</div>
+
+  <h2 class="section-title">Your Referral Link</h2>
+<div class="card">
+<div class="copy-row">
+<input id="generalLinkInput" readonly>
+<button class="secondary" onclick="copyLink('generalLinkInput')">Copy</button>
+  </div>
+  <p class="sub" style="margin:8px 0 0;">Share this link. Clicks and conversions are tracked automatically.</p>
+  </div>
+
+  <h2 class="section-title">Totals</h2>
+  <div class="stat-grid" id="statGrid"></div>
+
+  <h2 class="section-title">Your Campaigns</h2>
+  <div id="campaignsList"><p class="empty">No active campaign partnerships yet.</p></div>
+
+  <h2 class="section-title">Referral Links</h2>
+  <div class="row-list" id="linksList"></div>
+
+  <h2 class="section-title">Conversions</h2>
+  <div class="row-list" id="conversionsList"></div>
+
+  <h2 class="section-title">Earnings</h2>
+  <div class="row-list" id="earningsList"></div>
+
+  <h2 class="section-title">Content Assignments</h2>
+  <div class="row-list" id="assignmentsList"></div>
+  </div>
+  </div>
+
+  <script>
+  function getToken(){
+const params = new URLSearchParams(window.location.search);
+return params.get("token") || "";
+}
+const TOKEN = getToken();
+
+function escapeHtml(s){
+  return (s || "").replace(/[&<>"']/g, function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; });
+    }
+
+function fmtMoney(n){
+  return "$" + (Math.round((Number(n) || 0) * 100) / 100).toFixed(2);
+}
+
+function fmtDate(s){
+  if (!s) return "";
+try{ return new Date(s).toLocaleDateString(); } catch(e){ return s; }
+}
+
+async function loadDashboard(){
+if (!TOKEN){
+document.getElementById("loadingView").classList.add("hidden");
+document.getElementById("noTokenView").classList.remove("hidden");
+return;
+}
+try{
+const res = await fetch("/api/partner/dashboard", { headers: { Authorization: "Bearer " + TOKEN } });
+const data = await res.json();
+if (!res.ok) throw new Error(data.error || "Couldn't load dashboard.");
+renderDashboard(data);
+} catch(e){
+  document.getElementById("loadingView").innerHTML = "<p class=\"empty\">" + escapeHtml(e.message) + "</p>";
+}
+}
+
+function renderDashboard(data){
+  document.getElementById("loadingView").classList.add("hidden");
+document.getElementById("dashView").classList.remove("hidden");
+const p = data.partner;
+document.getElementById("partnerName").textContent = "Welcome, " + p.name;
+document.getElementById("partnerMeta").textContent = p.partner_type + " · " + p.level + " level · status: " + p.status + " · referral code " + p.referral_code;
+if (data.disclaimer) document.getElementById("disclaimerText").textContent = data.disclaimer;
+
+const origin = window.location.origin;
+document.getElementById("generalLinkInput").value = origin + "/r/" + data.general_referral_link.code;
+
+const t = data.totals_by_status || {};
+document.getElementById("statGrid").innerHTML =
+  statHtml(data.total_clicks, "Total Clicks") +
+  statHtml(fmtMoney(t.pending), "Pending") +
+  statHtml(fmtMoney(t.approved), "Approved") +
+  statHtml(fmtMoney(t.processing), "Processing") +
+  statHtml(fmtMoney(t.paid), "Paid Out");
+
+const campaigns = data.campaigns || [];
+document.getElementById("campaignsList").innerHTML = campaigns.length ? campaigns.map(function(c){
+  return "<div class=\"card\"><div class=\"title\">" + escapeHtml(c.name) + "</div>" +
+    "<p class=\"sub\" style=\"margin:6px 0 10px;\">" + escapeHtml(c.description || "") + "</p>" +
+    "<button class=\"secondary\" onclick=\"getCampaignLink('" + c.id + "')\">Get my link for this campaign</button></div>";
+}).join("") : "<p class=\"empty\">No active campaign partnerships yet. Check the Earn Money page for open opportunities.</p>";
+
+const links = data.referral_links || [];
+document.getElementById("linksList").innerHTML = links.length ? links.map(function(l){
+  return "<div class=\"row-item\"><div><div class=\"title\">" + origin + "/r/" + escapeHtml(l.code) + "</div>" +
+    "<div class=\"meta\">" + (l.campaign_id ? "Campaign link" : "General link") + " · created " + fmtDate(l.created_at) + "</div></div></div>";
+}).join("") : "<p class=\"empty\">No referral links yet.</p>";
+
+const conversions = data.conversions || [];
+document.getElementById("conversionsList").innerHTML = conversions.length ? conversions.map(function(c){
+  return "<div class=\"row-item\"><div><div class=\"title\">" + escapeHtml(c.conversion_type.replace("_"," ")) + " — " + fmtMoney(c.revenue_amount) + "</div>" +
+    "<div class=\"meta\">" + fmtDate(c.occurred_at) + "</div></div><span class=\"badge " + c.status + "\">" + c.status.replace("_"," ") + "</span></div>";
+}).join("") : "<p class=\"empty\">No conversions recorded yet.</p>";
+
+const earnings = data.earnings || [];
+document.getElementById("earningsList").innerHTML = earnings.length ? earnings.map(function(e){
+  return "<div class=\"row-item\"><div><div class=\"title\">" + escapeHtml(e.earning_type) + " — " + fmtMoney(e.amount) + "</div>" +
+    "<div class=\"meta\">" + fmtDate(e.created_at) + "</div></div><span class=\"badge " + e.status + "\">" + e.status + "</span></div>";
+}).join("") : "<p class=\"empty\">No earnings yet.</p>";
+
+const assignments = data.content_assignments || [];
+document.getElementById("assignmentsList").innerHTML = assignments.length ? assignments.map(function(a){
+  return "<div class=\"row-item\"><div><div class=\"title\">" + escapeHtml(a.requirement_label) + "</div>" +
+    "<div class=\"meta\">" + (a.platform ? escapeHtml(a.platform) + " · " : "") + (a.due_at ? "due " + fmtDate(a.due_at) : "") + "</div></div>" +
+    "<span class=\"badge " + a.status + "\">" + a.status.replace("_"," ") + "</span></div>";
+}).join("") : "<p class=\"empty\">No content assignments yet.</p>";
+}
+
+function statHtml(num, label){
+  return "<div class=\"stat\"><div class=\"num\">" + num + "</div><div class=\"label\">" + label + "</div></div>";
+}
+
+function copyLink(inputId){
+  const el = document.getElementById(inputId);
+el.select();
+document.execCommand("copy");
+}
+
+async function getCampaignLink(campaignId){
+try{
+const res = await fetch("/api/partner/referral-links", { method: "POST", headers: { "content-type": "application/json", Authorization: "Bearer " + TOKEN }, body: JSON.stringify({ campaign_id: campaignId }) });
+const data = await res.json();
+if (!res.ok) throw new Error(data.error || "Couldn't create link.");
+alert("Your link: " + window.location.origin + "/r/" + data.referral_link.code);
+loadDashboard();
+} catch(e){
+alert(e.message);
+}
+}
+
+loadDashboard();
+</script>
+  </body>
+  </html>
+  
