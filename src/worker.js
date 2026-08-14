@@ -86,7 +86,34 @@ async function requireAuth(request, env) {
   const token = authHeader.replace(/^Bearer\s+/i, "");
   return verifySessionToken(env, token);
 }
+// ---------- OAuth state (CSRF protection for the YouTube connect flow) ----------
+// Google redirects the browser straight back to our callback with no way to
+// attach an Authorization header, so the callback can't use requireAuth like
+// everything else. Instead we sign a short-lived "state" value with the same
+// SESSION_SECRET used for login sessions, and only proceed if it verifies.
 
+async function makeOAuthState(env, platform) {
+  const payload = `${platform}:${Date.now() + 1000 * 60 * 10}`; // 10 minute expiry
+  const sig = await hmac(env.SESSION_SECRET, payload);
+  return `${btoa(payload)}.${sig}`;
+}
+
+async function verifyOAuthState(env, state, platform) {
+  if (!state) return false;
+  const [payloadB64, sig] = state.split(".");
+  if (!payloadB64 || !sig) return false;
+  let payload;
+  try {
+    payload = atob(payloadB64);
+  } catch (e) {
+    return false;
+  }
+  const expected = await hmac(env.SESSION_SECRET, payload);
+  if (expected !== sig) return false;
+  const [p, expiresAt] = payload.split(":");
+  if (p !== platform) return false;
+  return Date.now() < Number(expiresAt);
+}
 // ---------- media library ----------
 
 async function handleMediaUpload(request, env) {
@@ -371,8 +398,80 @@ async function publishToYouTube(env, content) {
   if (!conn || !conn.connected) {
     return { status: "not_connected", error_message: "YouTube channel not connected yet (Phase 0 setup required)." };
   }
-  // TODO: real resumable upload via YouTube Data API v3.
-  return { status: "not_connected", error_message: "YouTube publisher not yet implemented." };
+    if (content.content_type !== "video") {
+    return { status: "failed", error_message: "YouTube only accepts video content; this item isn't a video." };
+  }
+
+  const media = await env.DB.prepare(
+    `SELECT m.* FROM creator_content_media cm
+     JOIN media_library m ON m.id = cm.media_id
+     WHERE cm.creator_content_id = ? AND m.media_type = 'video'
+     ORDER BY cm.position ASC LIMIT 1`
+  )
+    .bind(content.id)
+    .first();
+  if (!media) return { status: "failed", error_message: "No video file is attached to this content." };
+
+  const accessToken = await getValidYouTubeAccessToken(env);
+  if (!accessToken) {
+    return {
+      status: "failed",
+      error_message: "YouTube authorization is missing or expired. Reconnect YouTube from Social Publishing and try again.",
+    };
+  }
+
+  const r2Object = await env.MEDIA_BUCKET.get(media.r2_key);
+  if (!r2Object) return { status: "failed", error_message: "Video file could not be found in storage (" + media.r2_key + ")." };
+
+  const contentType = (r2Object.httpMetadata && r2Object.httpMetadata.contentType) || "video/*";
+  const contentLength = String(media.file_size || r2Object.size || 0);
+
+  // Step 1: start a resumable upload session with the video's metadata.
+  const initResp = await fetch(
+    "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json; charset=UTF-8",
+        "X-Upload-Content-Type": contentType,
+        "X-Upload-Content-Length": contentLength,
+      },
+      body: JSON.stringify({
+        snippet: {
+          title: (content.title || "Dr Bro Vibes").slice(0, 100),
+          description: content.description || content.caption || "",
+        },
+        status: { privacyStatus: "public" },
+      }),
+    }
+  );
+  if (!initResp.ok) {
+    const errText = await initResp.text().catch(() => "");
+    return { status: "failed", error_message: "YouTube upload session could not be started: " + errText.slice(0, 300) };
+  }
+  const uploadUrl = initResp.headers.get("Location");
+  if (!uploadUrl) return { status: "failed", error_message: "YouTube did not return an upload URL." };
+
+  // Step 2: stream the actual video bytes from R2 straight to that upload URL.
+  const uploadResp = await fetch(uploadUrl, {
+    method: "PUT",
+    headers: { "Content-Type": contentType, "Content-Length": contentLength },
+    body: r2Object.body,
+  });
+  const uploadData = await uploadResp.json().catch(() => ({}));
+  if (!uploadResp.ok || !uploadData.id) {
+    return {
+      status: "failed",
+      error_message: "YouTube upload failed: " + ((uploadData.error && uploadData.error.message) || uploadResp.statusText),
+    };
+  }
+
+  return {
+    status: "published",
+    platform_url: `https://www.youtube.com/watch?v=${uploadData.id}`,
+    platform_post_id: uploadData.id,
+  };
 }
 
 const PUBLISHERS = {
@@ -504,6 +603,150 @@ async function handleConnectionsList(env) {
   return json({ connections: results });
 }
 
+// ---------- YouTube OAuth (Google) ----------
+
+// Adds the columns needed to store a connected channel's tokens. Safe to run
+// more than once -- each ALTER TABLE is wrapped so an "already exists" error
+// on a repeat run doesn't fail the whole batch, matching the pattern used by
+// handleSetupRecommendationSchema above.
+async function handleSetupOAuthSchema(env) {
+  const statements = [
+    "ALTER TABLE platform_connections ADD COLUMN access_token TEXT",
+    "ALTER TABLE platform_connections ADD COLUMN refresh_token TEXT",
+    "ALTER TABLE platform_connections ADD COLUMN token_expires_at TEXT",
+    "ALTER TABLE platform_connections ADD COLUMN external_channel_id TEXT",
+    "ALTER TABLE platform_connections ADD COLUMN scope TEXT",
+  ];
+  const results = [];
+  for (const sql of statements) {
+    try {
+      await env.DB.prepare(sql).run();
+      results.push({ ok: true, statement: sql });
+    } catch (e) {
+      results.push({ ok: false, statement: sql, error: String((e && e.message) || e) });
+    }
+  }
+  const failed = results.filter((r) => !r.ok).length;
+  return json({ ok: failed === 0, total: results.length, failed, results });
+}
+
+// Called by the admin dashboard (authenticated) to get a Google consent URL.
+// The browser then navigates itself to that URL -- we can't redirect it
+// directly from here because this response has to carry the Bearer-token
+// check, and Google's own redirect back to us won't carry that header.
+async function handleYouTubeOAuthAuthorize(request, env) {
+  if (!env.YOUTUBE_CLIENT_ID) {
+    return err("YouTube OAuth isn't configured yet -- add the YOUTUBE_CLIENT_ID secret first.", 500);
+  }
+  const state = await makeOAuthState(env, "youtube");
+  const redirectUri = new URL("/api/oauth/youtube/callback", request.url).toString();
+  const params = new URLSearchParams({
+    client_id: env.YOUTUBE_CLIENT_ID,
+    redirect_uri: redirectUri,
+    response_type: "code",
+    scope: "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly",
+    access_type: "offline", // required to get a refresh_token back
+    prompt: "consent", // forces a refresh_token every time, not just the first
+    state,
+  });
+  return json({ url: "https://accounts.google.com/o/oauth2/v2/auth?" + params.toString() });
+}
+
+// Small standalone HTML page so the browser tab Google redirects back to
+// shows a readable result instead of raw JSON.
+function htmlOAuthResult(success, message) {
+  return new Response(
+    `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${success ? "Connected" : "Connection failed"}</title>
+<style>
+  body{font-family:system-ui,sans-serif;background:#0A0A0B;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:24px;text-align:center;}
+  .card{background:#151516;padding:32px;border-radius:16px;border:1px solid rgba(255,255,255,0.1);max-width:420px;}
+  h1{font-size:1.1rem;margin:0 0 12px;color:${success ? "#2DD4BF" : "#FF5B5B"};}
+  p{color:#a8a6ac;font-size:0.9rem;}
+</style></head>
+<body><div class="card"><h1>${success ? "Connected" : "Connection failed"}</h1><p>${message}</p></div></body></html>`,
+    { status: success ? 200 : 400, headers: { "content-type": "text/html;charset=UTF-8" } }
+  );
+}
+
+// Public route: this is where Google redirects the browser back to after the
+// user approves (or denies) access. No Authorization header will be present
+// on this request -- the signed `state` param is what proves it's legitimate.
+async function handleYouTubeOAuthCallback(request, env) {
+  const url = new URL(request.url);
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+  const oauthError = url.searchParams.get("error");
+
+  if (oauthError) return htmlOAuthResult(false, `Google returned an error: ${oauthError}`);
+  if (!code) return htmlOAuthResult(false, "Missing authorization code from Google.");
+
+  const validState = await verifyOAuthState(env, state, "youtube");
+  if (!validState) {
+    return htmlOAuthResult(false, "This authorization link is invalid or has expired. Go back to Social Publishing and click Connect again.");
+  }
+  if (!env.YOUTUBE_CLIENT_ID || !env.YOUTUBE_CLIENT_SECRET) {
+    return htmlOAuthResult(false, "YouTube OAuth isn't fully configured (missing client credentials).");
+  }
+
+  const redirectUri = new URL("/api/oauth/youtube/callback", request.url).toString();
+  const tokenResp = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: env.YOUTUBE_CLIENT_ID,
+      client_secret: env.YOUTUBE_CLIENT_SECRET,
+      code,
+      grant_type: "authorization_code",
+      redirect_uri: redirectUri,
+    }),
+  });
+  const tokenData = await tokenResp.json().catch(() => ({}));
+  if (!tokenResp.ok || !tokenData.access_token) {
+    return htmlOAuthResult(false, "Google token exchange failed: " + (tokenData.error_description || tokenData.error || "unknown error"));
+  }
+
+  // Look up the channel so the dashboard can show which one got connected.
+  let channelLabel = null;
+  let channelId = null;
+  try {
+    const chResp = await fetch("https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true", {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+    const chData = await chResp.json();
+    const ch = chData.items && chData.items[0];
+    if (ch) {
+      channelId = ch.id;
+      channelLabel = ch.snippet && ch.snippet.title;
+    }
+  } catch (e) {
+    // Non-fatal -- the connection still works without a friendly label.
+  }
+
+  const expiresAt = new Date(Date.now() + (tokenData.expires_in || 3600) * 1000).toISOString();
+
+  await env.DB.prepare(
+    `UPDATE platform_connections
+     SET connected = 1, account_label = ?, connected_at = datetime('now'),
+         access_token = ?, refresh_token = COALESCE(?, refresh_token),
+         token_expires_at = ?, external_channel_id = ?, scope = ?, last_error = NULL
+     WHERE platform = 'youtube'`
+  )
+    .bind(channelLabel, tokenData.access_token, tokenData.refresh_token || null, expiresAt, channelId, tokenData.scope || null)
+    .run();
+
+  return htmlOAuthResult(true, `YouTube connected${channelLabel ? " — " + channelLabel : ""}. You can close this tab and go back to the dashboard.`);
+}
+
+async function handleYouTubeDisconnect(env) {
+  await env.DB.prepare(
+    `UPDATE platform_connections
+     SET connected = 0, access_token = NULL, refresh_token = NULL, token_expires_at = NULL, last_error = NULL
+     WHERE platform = 'youtube'`
+  ).run();
+  return json({ ok: true });
+}
+
 // ---------- router ----------
 
 export default {
@@ -525,6 +768,10 @@ export default {
       if (pathname === "/api/public/content" && method === "GET") return handlePublicContent(env);
       const partnerPublicResp = await handlePublicPartnerRoutes(request, env, pathname, method); if (partnerPublicResp) return partnerPublicResp;
 
+      // Google redirects here with no Authorization header -- the signed
+      // `state` param (verified inside the handler) is what proves it's real.
+      if (pathname === "/api/oauth/youtube/callback" && method === "GET") return handleYouTubeOAuthCallback(request, env);
+
       // Login
       if (pathname === "/api/login" && method === "POST") {
         const body = await request.json();
@@ -543,6 +790,9 @@ export default {
       if (pathname === "/api/media" && method === "GET") return handleMediaList(env);
 
       if (pathname === "/api/connections" && method === "GET") return handleConnectionsList(env);
+      if (pathname === "/api/oauth/youtube/authorize" && method === "GET") return handleYouTubeOAuthAuthorize(request, env);
+      if (pathname === "/api/oauth/youtube/disconnect" && method === "POST") return handleYouTubeDisconnect(env);
+      if (pathname === "/api/admin/setup-oauth-schema" && method === "POST") return handleSetupOAuthSchema(env);
       const partnerAdminResp = await handleAdminPartnerRoutes(request, env, pathname, method); if (partnerAdminResp) return partnerAdminResp;
 
       if (pathname === "/api/galleries" && method === "POST") return handleGalleryCreate(request, env);
