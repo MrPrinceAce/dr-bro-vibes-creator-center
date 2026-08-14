@@ -518,10 +518,12 @@ export default {
       if (mediaMatch && method === "GET") {
         return handleMediaServe(request, env, mediaMatch[1]);
       }
+      const refMatch = pathname.match(/^\/r\/([^/]+)$/); if (refMatch && method === "GET") { return handleReferralClick(request, env, refMatch[1]); }
 
       // Public, no-auth endpoints
       if (pathname === "/api/public/galleries" && method === "GET") return handlePublicGalleries(env);
       if (pathname === "/api/public/content" && method === "GET") return handlePublicContent(env);
+      const partnerPublicResp = await handlePublicPartnerRoutes(request, env, pathname, method); if (partnerPublicResp) return partnerPublicResp;
 
       // Login
       if (pathname === "/api/login" && method === "POST") {
@@ -541,6 +543,7 @@ export default {
       if (pathname === "/api/media" && method === "GET") return handleMediaList(env);
 
       if (pathname === "/api/connections" && method === "GET") return handleConnectionsList(env);
+      const partnerAdminResp = await handleAdminPartnerRoutes(request, env, pathname, method); if (partnerAdminResp) return partnerAdminResp;
 
       if (pathname === "/api/galleries" && method === "POST") return handleGalleryCreate(request, env);
       if (pathname === "/api/galleries" && method === "GET") return handleGalleryList(env);
@@ -580,3 +583,541 @@ export default {
     }
   },
 };
+
+
+// =====================================================================
+// PARTNER & CREATOR PROGRAM -- backend routes and helpers
+// Real recorded activity only: referral clicks/conversions/earnings are
+// written by real link visits and real admin-recorded sales/signups.
+// No demo/fake data is seeded or fabricated here.
+// =====================================================================
+
+function randomCode(len) {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let out = "";
+  for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+
+function randomToken() {
+  return crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
+}
+
+async function hashIp(env, ip) {
+  if (!ip) return null;
+  return hmac(env.SESSION_SECRET, "ip:" + ip);
+}
+
+function round2(n) {
+  return Math.round((Number(n) || 0) * 100) / 100;
+}
+
+const EARNINGS_DISCLAIMER = "Earnings depend on actual performance: verified referrals, eligible sales, and the specific campaign's compensation terms. Nothing here is a guaranteed income.";
+
+function describeCompensation(c) {
+  if (c.commission_type === "percentage") return c.commission_value + "% commission per eligible sale/signup. " + EARNINGS_DISCLAIMER;
+  if (c.commission_type === "fixed_per_referral") return "$" + c.commission_value + " per verified referral. " + EARNINGS_DISCLAIMER;
+  if (c.commission_type === "fixed_per_sale") return "$" + c.commission_value + " per verified sale. " + EARNINGS_DISCLAIMER;
+  if (c.commission_type === "fixed_payment") return "Fixed payment of $" + c.fixed_payment_amount + " for completing this partnership's requirements, subject to campaign terms. " + EARNINGS_DISCLAIMER;
+  return "Custom compensation terms -- see campaign requirements for details. " + EARNINGS_DISCLAIMER;
+}
+
+async function getPartnerByToken(env, token) {
+  if (!token) return null;
+  return env.DB.prepare("SELECT * FROM partners WHERE dashboard_token = ?").bind(token).first();
+}
+
+function partnerTokenFromRequest(request) {
+  const authHeader = request.headers.get("Authorization") || "";
+  const bearer = authHeader.replace(/^Bearer\s+/i, "");
+  if (bearer) return bearer;
+  const url = new URL(request.url);
+  return url.searchParams.get("token") || "";
+}
+
+async function ensureGeneralReferralLink(env, partner) {
+  let link = await env.DB.prepare("SELECT * FROM referral_links WHERE partner_id = ? AND campaign_id IS NULL").bind(partner.id).first();
+  if (link) return link;
+  const id = uuid();
+  await env.DB.prepare("INSERT INTO referral_links (id, partner_id, campaign_id, code, destination_url) VALUES (?, ?, NULL, ?, '/')").bind(id, partner.id, partner.referral_code).run();
+  return env.DB.prepare("SELECT * FROM referral_links WHERE id = ?").bind(id).first();
+}
+
+async function computeCommissionAmount(env, campaign, partner, conversion) {
+  let type = campaign ? campaign.commission_type : "percentage";
+  let value = campaign ? campaign.commission_value : partner.default_commission_pct;
+  if ((value === null || value === undefined) && partner.default_commission_pct !== null) { type = "percentage"; value = partner.default_commission_pct; }
+  if (type === "fixed_payment") return round2(campaign ? campaign.fixed_payment_amount : 0);
+  if (type === "fixed_per_referral" || type === "fixed_per_sale") return round2(value || 0);
+  if (type === "percentage") return round2(((value || 0) / 100) * (conversion.revenue_amount || 0));
+  return 0;
+}
+
+async function handleReferralClick(request, env, code) {
+  const link = await env.DB.prepare("SELECT * FROM referral_links WHERE code = ?").bind(code).first();
+  const origin = new URL(request.url).origin;
+  if (!link) return Response.redirect(origin + "/", 302);
+  const ip = request.headers.get("CF-Connecting-IP") || "";
+  const ipHash = await hashIp(env, ip);
+  await env.DB.prepare("INSERT INTO referral_clicks (id, referral_link_id, ip_hash, user_agent, referer) VALUES (?, ?, ?, ?, ?)").bind(uuid(), link.id, ipHash, request.headers.get("User-Agent") || "", request.headers.get("Referer") || "").run();
+  await env.DB.prepare("UPDATE partners SET last_active_at = datetime('now') WHERE id = ?").bind(link.partner_id).run();
+  const dest = link.destination_url && link.destination_url !== "/" ? link.destination_url : "/";
+  const headers = new Headers();
+  headers.set("Location", origin + dest);
+  headers.append("Set-Cookie", "drbv_ref=" + encodeURIComponent(code) + "; Max-Age=2592000; Path=/");
+  return new Response(null, { status: 302, headers });
+}
+
+async function handleEarnMoneyList(env) {
+  const { results: campaigns } = await env.DB.prepare("SELECT * FROM campaigns WHERE status IN ('open','active') ORDER BY created_at DESC").all();
+  const { results: levels } = await env.DB.prepare("SELECT * FROM partner_levels ORDER BY sort_order ASC").all();
+  const list = campaigns.map((c) => Object.assign({}, c, { compensation_summary: describeCompensation(c) }));
+  return json({ campaigns: list, partner_levels: levels, disclaimer: EARNINGS_DISCLAIMER });
+}
+
+async function handlePartnerApplicationCreate(request, env) {
+  const body = await request.json().catch(() => ({}));
+  if (!body.applicant_name || !body.applicant_email) return err("applicant_name and applicant_email are required.");
+  const id = uuid();
+  await env.DB.prepare("INSERT INTO partner_applications (id, applicant_name, applicant_email, requested_partner_type, campaign_id, message) VALUES (?, ?, ?, ?, ?, ?)").bind(id, body.applicant_name, body.applicant_email, body.requested_partner_type || "affiliate", body.campaign_id || null, body.message || null).run();
+  const row = await env.DB.prepare("SELECT * FROM partner_applications WHERE id = ?").bind(id).first();
+  return json({ application: row }, 201);
+}
+
+async function handlePartnerDashboard(request, env) {
+  const token = partnerTokenFromRequest(request);
+  const partner = await getPartnerByToken(env, token);
+  if (!partner) return err("Invalid or missing partner token.", 401);
+  const generalLink = await ensureGeneralReferralLink(env, partner);
+  const { results: links } = await env.DB.prepare("SELECT * FROM referral_links WHERE partner_id = ?").bind(partner.id).all();
+  const { results: conversions } = await env.DB.prepare("SELECT * FROM referral_conversions WHERE partner_id = ? ORDER BY occurred_at DESC").bind(partner.id).all();
+  const { results: earnings } = await env.DB.prepare("SELECT * FROM earnings WHERE partner_id = ? ORDER BY created_at DESC").bind(partner.id).all();
+  const { results: campaigns } = await env.DB.prepare("SELECT c.* FROM campaigns c JOIN campaign_partners cp ON cp.campaign_id = c.id WHERE cp.partner_id = ? AND cp.status = 'active'").bind(partner.id).all();
+  const { results: assignments } = await env.DB.prepare("SELECT * FROM content_assignments WHERE partner_id = ? ORDER BY created_at DESC").bind(partner.id).all();
+  let totalClicks = 0;
+  for (const l of links) {
+    const row = await env.DB.prepare("SELECT COUNT(*) as n FROM referral_clicks WHERE referral_link_id = ?").bind(l.id).first();
+    totalClicks += row.n;
+  }
+  const totals = { pending: 0, approved: 0, processing: 0, paid: 0 };
+  for (const e of earnings) { if (totals[e.status] !== undefined) totals[e.status] += e.amount; }
+  return json({
+    partner: { id: partner.id, name: partner.name, email: partner.email, partner_type: partner.partner_type, status: partner.status, level: partner.level, referral_code: partner.referral_code, default_commission_pct: partner.default_commission_pct },
+    general_referral_link: generalLink,
+    referral_links: links,
+    campaigns: campaigns,
+    conversions: conversions,
+    earnings: earnings,
+    content_assignments: assignments,
+    totals_by_status: { pending: round2(totals.pending), approved: round2(totals.approved), processing: round2(totals.processing), paid: round2(totals.paid) },
+    total_clicks: totalClicks,
+    disclaimer: EARNINGS_DISCLAIMER,
+  });
+}
+
+async function handlePartnerReferralLinkCreate(request, env) {
+  const token = partnerTokenFromRequest(request);
+  const partner = await getPartnerByToken(env, token);
+  if (!partner) return err("Invalid or missing partner token.", 401);
+  const body = await request.json().catch(() => ({}));
+  if (!body.campaign_id) return err("campaign_id is required.");
+  const membership = await env.DB.prepare("SELECT * FROM campaign_partners WHERE campaign_id = ? AND partner_id = ? AND status = 'active'").bind(body.campaign_id, partner.id).first();
+  if (!membership) return err("You are not an active partner on this campaign.", 403);
+  let link = await env.DB.prepare("SELECT * FROM referral_links WHERE partner_id = ? AND campaign_id = ?").bind(partner.id, body.campaign_id).first();
+  if (link) return json({ referral_link: link });
+  const id = uuid();
+  const code = partner.referral_code + "-" + randomCode(4);
+  await env.DB.prepare("INSERT INTO referral_links (id, partner_id, campaign_id, code, destination_url) VALUES (?, ?, ?, ?, ?)").bind(id, partner.id, body.campaign_id, code, body.destination_url || "/").run();
+  link = await env.DB.prepare("SELECT * FROM referral_links WHERE id = ?").bind(id).first();
+  return json({ referral_link: link }, 201);
+}
+
+async function handlePartnerContentAssignmentSubmit(request, env, id) {
+  const token = partnerTokenFromRequest(request);
+  const partner = await getPartnerByToken(env, token);
+  if (!partner) return err("Invalid or missing partner token.", 401);
+  const assignment = await env.DB.prepare("SELECT * FROM content_assignments WHERE id = ? AND partner_id = ?").bind(id, partner.id).first();
+  if (!assignment) return err("Assignment not found.", 404);
+  const body = await request.json().catch(() => ({}));
+  await env.DB.prepare("UPDATE content_assignments SET status = 'submitted', content_id = ?, submitted_at = datetime('now') WHERE id = ?").bind(body.content_id || null, id).run();
+  const row = await env.DB.prepare("SELECT * FROM content_assignments WHERE id = ?").bind(id).first();
+  return json({ assignment: row });
+}
+
+async function handlePublicPartnerRoutes(request, env, pathname, method) {
+  if (pathname === "/api/public/earn-money" && method === "GET") return handleEarnMoneyList(env);
+  if (pathname === "/api/public/partner-applications" && method === "POST") return handlePartnerApplicationCreate(request, env);
+  if (pathname === "/api/partner/dashboard" && method === "GET") return handlePartnerDashboard(request, env);
+  if (pathname === "/api/partner/referral-links" && method === "POST") return handlePartnerReferralLinkCreate(request, env);
+  const am = pathname.match(/^\/api\/partner\/content-assignments\/([^/]+)\/submit$/);
+  if (am && method === "POST") return handlePartnerContentAssignmentSubmit(request, env, am[1]);
+  return null;
+}
+
+async function handlePartnerOverview(env) {
+  const partnerCount = await env.DB.prepare("SELECT COUNT(*) as n FROM partners WHERE status = 'active'").first();
+  const pendingApps = await env.DB.prepare("SELECT COUNT(*) as n FROM partner_applications WHERE status = 'pending'").first();
+  const openFlags = await env.DB.prepare("SELECT COUNT(*) as n FROM fraud_flags WHERE status = 'open'").first();
+  const pendingEarnings = await env.DB.prepare("SELECT COALESCE(SUM(amount),0) as total FROM earnings WHERE status = 'pending'").first();
+  const paidEarnings = await env.DB.prepare("SELECT COALESCE(SUM(amount),0) as total FROM earnings WHERE status = 'paid'").first();
+  const totalClicks = await env.DB.prepare("SELECT COUNT(*) as n FROM referral_clicks").first();
+  const totalConversions = await env.DB.prepare("SELECT COUNT(*) as n FROM referral_conversions WHERE status = 'verified'").first();
+  return json({
+    active_partners: partnerCount.n,
+    pending_applications: pendingApps.n,
+    open_fraud_flags: openFlags.n,
+    pending_earnings_total: round2(pendingEarnings.total),
+    paid_earnings_total: round2(paidEarnings.total),
+    total_referral_clicks: totalClicks.n,
+    verified_conversions: totalConversions.n,
+    note: "All figures above are computed from real recorded clicks, admin-recorded conversions, and earnings/payouts in this database -- none are simulated.",
+  });
+}
+
+async function handlePartnerAdminList(request, env) {
+  const url = new URL(request.url);
+  const status = url.searchParams.get("status");
+  const type = url.searchParams.get("type");
+  let q = "SELECT * FROM partners";
+  const conds = [];
+  const binds = [];
+  if (status) { conds.push("status = ?"); binds.push(status); }
+  if (type) { conds.push("partner_type = ?"); binds.push(type); }
+  if (conds.length) q += " WHERE " + conds.join(" AND ");
+  q += " ORDER BY created_at DESC";
+const { results } = await env.DB.prepare(q).bind(...binds).all();
+  return json({ partners: results });
+}
+
+async function handlePartnerAdminCreate(request, env) {
+  const body = await request.json().catch(() => ({}));
+  if (!body.name || !body.email) return err("name and email are required.");
+  const id = uuid();
+  const code = (body.referral_code || randomCode(6)).toUpperCase();
+  const token = randomToken();
+  await env.DB.prepare("INSERT INTO partners (id, name, email, phone, partner_type, status, level, referral_code, dashboard_token, default_commission_pct, social_links, audience_size, location, category, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, body.name, body.email, body.phone || null, body.partner_type || "affiliate", body.status || "pending", body.level || "new", code, token, body.default_commission_pct != null ? body.default_commission_pct : null, body.social_links || null, body.audience_size != null ? body.audience_size : null, body.location || null, body.category || null, body.notes || null).run();
+  const row = await env.DB.prepare("SELECT * FROM partners WHERE id = ?").bind(id).first();
+  return json({ partner: row }, 201);
+}
+
+async function handlePartnerAdminDetail(env, id) {
+  const partner = await env.DB.prepare("SELECT * FROM partners WHERE id = ?").bind(id).first();
+  if (!partner) return err("Partner not found.", 404);
+  const { results: links } = await env.DB.prepare("SELECT * FROM referral_links WHERE partner_id = ?").bind(id).all();
+  const { results: conversions } = await env.DB.prepare("SELECT * FROM referral_conversions WHERE partner_id = ? ORDER BY occurred_at DESC").bind(id).all();
+  const { results: earnings } = await env.DB.prepare("SELECT * FROM earnings WHERE partner_id = ? ORDER BY created_at DESC").bind(id).all();
+  const { results: payouts } = await env.DB.prepare("SELECT * FROM payouts WHERE partner_id = ? ORDER BY requested_at DESC").bind(id).all();
+  const { results: notes } = await env.DB.prepare("SELECT * FROM partner_notes WHERE partner_id = ? ORDER BY created_at DESC").bind(id).all();
+  const { results: flags } = await env.DB.prepare("SELECT * FROM fraud_flags WHERE partner_id = ? ORDER BY created_at DESC").bind(id).all();
+  return json({ partner: partner, referral_links: links, conversions: conversions, earnings: earnings, payouts: payouts, notes: notes, fraud_flags: flags });
+}
+
+async function handlePartnerAdminUpdate(request, env, id) {
+  const body = await request.json().catch(() => ({}));
+  const fields = ["name","email","phone","partner_type","status","level","default_commission_pct","social_links","audience_size","location","category"];
+  const sets = [];
+  const binds = [];
+  for (const f of fields) { if (body[f] !== undefined) { sets.push(f + " = ?"); binds.push(body[f]); } }
+  if (!sets.length) return err("No updatable fields provided.");
+  sets.push("updated_at = datetime('now')");
+  binds.push(id);
+  await env.DB.prepare("UPDATE partners SET " + sets.join(", ") + " WHERE id = ?").bind(...binds).run();
+  const row = await env.DB.prepare("SELECT * FROM partners WHERE id = ?").bind(id).first();
+  return json({ partner: row });
+}
+
+async function handlePartnerAdminAddNote(request, env, id) {
+  const body = await request.json().catch(() => ({}));
+  if (!body.note) return err("note is required.");
+  const noteId = uuid();
+  await env.DB.prepare("INSERT INTO partner_notes (id, partner_id, note) VALUES (?, ?, ?)").bind(noteId, id, body.note).run();
+  const row = await env.DB.prepare("SELECT * FROM partner_notes WHERE id = ?").bind(noteId).first();
+  return json({ note: row }, 201);
+}
+
+async function handleApplicationsList(env) {
+  const { results } = await env.DB.prepare("SELECT * FROM partner_applications ORDER BY created_at DESC").all();
+  return json({ applications: results });
+}
+
+async function handleApplicationApprove(request, env, id) {
+  const app = await env.DB.prepare("SELECT * FROM partner_applications WHERE id = ?").bind(id).first();
+  if (!app) return err("Application not found.", 404);
+  if (app.status !== "pending") return err("Application already reviewed.", 409);
+  const body = await request.json().catch(() => ({}));
+  let partner = await env.DB.prepare("SELECT * FROM partners WHERE email = ?").bind(app.applicant_email).first();
+  if (!partner) {
+    const id2 = uuid();
+    const code = randomCode(6);
+    const token = randomToken();
+    await env.DB.prepare("INSERT INTO partners (id, name, email, partner_type, status, level, referral_code, dashboard_token, default_commission_pct) VALUES (?, ?, ?, ?, 'active', 'new', ?, ?, ?)").bind(id2, app.applicant_name, app.applicant_email, app.requested_partner_type, code, token, body.default_commission_pct != null ? body.default_commission_pct : null).run();
+    partner = await env.DB.prepare("SELECT * FROM partners WHERE id = ?").bind(id2).first();
+  } else {
+    await env.DB.prepare("UPDATE partners SET status = 'active', updated_at = datetime('now') WHERE id = ?").bind(partner.id).run();
+  }
+  if (app.campaign_id) {
+    await env.DB.prepare("INSERT OR IGNORE INTO campaign_partners (campaign_id, partner_id, status) VALUES (?, ?, 'active')").bind(app.campaign_id, partner.id).run();
+  }
+  await env.DB.prepare("UPDATE partner_applications SET status = 'approved', partner_id = ?, review_notes = ?, reviewed_at = datetime('now') WHERE id = ?").bind(partner.id, body.review_notes || null, id).run();
+  const row = await env.DB.prepare("SELECT * FROM partner_applications WHERE id = ?").bind(id).first();
+  return json({ application: row, partner: partner });
+}
+
+async function handleApplicationReject(request, env, id) {
+  const app = await env.DB.prepare("SELECT * FROM partner_applications WHERE id = ?").bind(id).first();
+  if (!app) return err("Application not found.", 404);
+  const body = await request.json().catch(() => ({}));
+  await env.DB.prepare("UPDATE partner_applications SET status = 'rejected', review_notes = ?, reviewed_at = datetime('now') WHERE id = ?").bind(body.review_notes || null, id).run();
+  const row = await env.DB.prepare("SELECT * FROM partner_applications WHERE id = ?").bind(id).first();
+  return json({ application: row });
+}
+
+async function handleCampaignsAdminList(env) {
+  const { results } = await env.DB.prepare("SELECT * FROM campaigns ORDER BY created_at DESC").all();
+  return json({ campaigns: results });
+}
+
+async function handleCampaignsAdminCreate(request, env) {
+  const body = await request.json().catch(() => ({}));
+  if (!body.name) return err("name is required.");
+  const id = uuid();
+  await env.DB.prepare("INSERT INTO campaigns (id, name, description, campaign_type, status, commission_type, commission_value, fixed_payment_amount, budget, starts_at, ends_at, requirements, bonus_rules, eligibility, target_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, body.name, body.description || null, body.campaign_type || "affiliate", body.status || "draft", body.commission_type || "percentage", body.commission_value != null ? body.commission_value : null, body.fixed_payment_amount != null ? body.fixed_payment_amount : null, body.budget != null ? body.budget : null, body.starts_at || null, body.ends_at || null, body.requirements || null, body.bonus_rules || null, body.eligibility || null, body.target_url || "/").run();
+  const row = await env.DB.prepare("SELECT * FROM campaigns WHERE id = ?").bind(id).first();
+  return json({ campaign: row }, 201);
+}
+
+async function handleCampaignsAdminUpdate(request, env, id) {
+  const body = await request.json().catch(() => ({}));
+  const fields = ["name","description","campaign_type","status","commission_type","commission_value","fixed_payment_amount","budget","starts_at","ends_at","requirements","bonus_rules","eligibility","target_url"];
+  const sets = [];
+  const binds = [];
+  for (const f of fields) { if (body[f] !== undefined) { sets.push(f + " = ?"); binds.push(body[f]); } }
+  if (!sets.length) return err("No updatable fields provided.");
+  sets.push("updated_at = datetime('now')");
+  binds.push(id);
+  await env.DB.prepare("UPDATE campaigns SET " + sets.join(", ") + " WHERE id = ?").bind(...binds).run();
+  const row = await env.DB.prepare("SELECT * FROM campaigns WHERE id = ?").bind(id).first();
+  return json({ campaign: row });
+}
+
+async function handleCampaignAddPartner(request, env, campaignId) {
+  const body = await request.json().catch(() => ({}));
+  if (!body.partner_id) return err("partner_id is required.");
+  const existing = await env.DB.prepare("SELECT * FROM campaign_partners WHERE campaign_id = ? AND partner_id = ?").bind(campaignId, body.partner_id).first();
+  if (existing) {
+    await env.DB.prepare("UPDATE campaign_partners SET status = 'active', commission_override_type = ?, commission_override_value = ?, fixed_payment_override = ? WHERE campaign_id = ? AND partner_id = ?").bind(body.commission_override_type || null, body.commission_override_value != null ? body.commission_override_value : null, body.fixed_payment_override != null ? body.fixed_payment_override : null, campaignId, body.partner_id).run();
+  } else {
+    await env.DB.prepare("INSERT INTO campaign_partners (campaign_id, partner_id, status, commission_override_type, commission_override_value, fixed_payment_override) VALUES (?, ?, 'active', ?, ?, ?)").bind(campaignId, body.partner_id, body.commission_override_type || null, body.commission_override_value != null ? body.commission_override_value : null, body.fixed_payment_override != null ? body.fixed_payment_override : null).run();
+  }
+  const row = await env.DB.prepare("SELECT * FROM campaign_partners WHERE campaign_id = ? AND partner_id = ?").bind(campaignId, body.partner_id).first();
+  return json({ campaign_partner: row }, 201);
+}
+
+async function handleConversionsAdminList(request, env) {
+  const url = new URL(request.url);
+  const status = url.searchParams.get("status");
+  let q = "SELECT * FROM referral_conversions";
+  const binds = [];
+  if (status) { q += " WHERE status = ?"; binds.push(status); }
+  q += " ORDER BY occurred_at DESC";
+  const { results } = await env.DB.prepare(q).bind(...binds).all();
+  return json({ conversions: results });
+}
+
+async function handleConversionsAdminCreate(request, env) {
+  const body = await request.json().catch(() => ({}));
+  if (!body.referral_link_id || !body.conversion_type) return err("referral_link_id and conversion_type are required.");
+  const link = await env.DB.prepare("SELECT * FROM referral_links WHERE id = ?").bind(body.referral_link_id).first();
+  if (!link) return err("referral_link_id not found.", 404);
+  const partner = await env.DB.prepare("SELECT * FROM partners WHERE id = ?").bind(link.partner_id).first();
+  const campaign = link.campaign_id ? await env.DB.prepare("SELECT * FROM campaigns WHERE id = ?").bind(link.campaign_id).first() : null;
+  const id = uuid();
+  const revenue = Number(body.revenue_amount) || 0;
+  await env.DB.prepare("INSERT INTO referral_conversions (id, referral_link_id, partner_id, campaign_id, conversion_type, reference_id, revenue_amount) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(id, link.id, partner.id, link.campaign_id || null, body.conversion_type, body.reference_id || null, revenue).run();
+  const conversion = await env.DB.prepare("SELECT * FROM referral_conversions WHERE id = ?").bind(id).first();
+  const amount = await computeCommissionAmount(env, campaign, partner, conversion);
+  const earningId = uuid();
+  await env.DB.prepare("INSERT INTO earnings (id, partner_id, campaign_id, conversion_id, earning_type, amount, status, notes) VALUES (?, ?, ?, ?, 'commission', ?, 'pending', ?)").bind(earningId, partner.id, link.campaign_id || null, id, amount, "Auto-calculated from conversion; pending admin verification.").run();
+  const earning = await env.DB.prepare("SELECT * FROM earnings WHERE id = ?").bind(earningId).first();
+  return json({ conversion: conversion, earning: earning }, 201);
+}
+
+async function handleConversionsAdminUpdate(request, env, id) {
+  const conv = await env.DB.prepare("SELECT * FROM referral_conversions WHERE id = ?").bind(id).first();
+  if (!conv) return err("Conversion not found.", 404);
+  const body = await request.json().catch(() => ({}));
+  if (!body.status) return err("status is required.");
+  await env.DB.prepare("UPDATE referral_conversions SET status = ?, flagged_reason = ?, verified_at = CASE WHEN ? = 'verified' THEN datetime('now') ELSE verified_at END WHERE id = ?").bind(body.status, body.flagged_reason || null, body.status, id).run();
+  if (body.status === "verified") {
+    await env.DB.prepare("UPDATE earnings SET status = 'approved', approved_at = datetime('now') WHERE conversion_id = ? AND status = 'pending'").bind(id).run();
+  } else if (body.status === "rejected") {
+    await env.DB.prepare("UPDATE earnings SET status = 'failed', notes = 'Underlying conversion was rejected by admin.' WHERE conversion_id = ? AND status = 'pending'").bind(id).run();
+  } else if (body.status === "flagged") {
+    await env.DB.prepare("INSERT INTO fraud_flags (id, partner_id, referral_conversion_id, reason) VALUES (?, ?, ?, ?)").bind(uuid(), conv.partner_id, id, body.flagged_reason || "Flagged by admin for review.").run();
+  }
+  const row = await env.DB.prepare("SELECT * FROM referral_conversions WHERE id = ?").bind(id).first();
+  return json({ conversion: row });
+}
+
+async function handleEarningsAdminList(request, env) {
+  const url = new URL(request.url);
+  const status = url.searchParams.get("status");
+  const partnerId = url.searchParams.get("partner_id");
+  let q = "SELECT * FROM earnings";
+  const conds = [];
+  const binds = [];
+  if (status) { conds.push("status = ?"); binds.push(status); }
+  if (partnerId) { conds.push("partner_id = ?"); binds.push(partnerId); }
+  if (conds.length) q += " WHERE " + conds.join(" AND ");
+  q += " ORDER BY created_at DESC";
+  const { results } = await env.DB.prepare(q).bind(...binds).all();
+  return json({ earnings: results });
+}
+
+async function handleEarningsAdminUpdate(request, env, id) {
+  const body = await request.json().catch(() => ({}));
+  if (!body.status) return err("status is required.");
+  await env.DB.prepare("UPDATE earnings SET status = ?, notes = COALESCE(?, notes), approved_at = CASE WHEN ? = 'approved' THEN datetime('now') ELSE approved_at END, paid_at = CASE WHEN ? = 'paid' THEN datetime('now') ELSE paid_at END WHERE id = ?").bind(body.status, body.notes || null, body.status, body.status, id).run();
+  const row = await env.DB.prepare("SELECT * FROM earnings WHERE id = ?").bind(id).first();
+  return json({ earning: row });
+}
+
+async function handlePayoutsAdminList(request, env) {
+  const url = new URL(request.url);
+  const partnerId = url.searchParams.get("partner_id");
+  let q = "SELECT * FROM payouts";
+  const binds = [];
+  if (partnerId) { q += " WHERE partner_id = ?"; binds.push(partnerId); }
+  q += " ORDER BY requested_at DESC";
+  const { results } = await env.DB.prepare(q).bind(...binds).all();
+  return json({ payouts: results });
+}
+
+async function handlePayoutsAdminCreate(request, env) {
+  const body = await request.json().catch(() => ({}));
+  if (!body.partner_id || !Array.isArray(body.earning_ids) || !body.earning_ids.length) return err("partner_id and earning_ids[] are required.");
+  const placeholders = body.earning_ids.map(() => "?").join(",");
+  const { results: earningsRows } = await env.DB.prepare("SELECT * FROM earnings WHERE id IN (" + placeholders + ") AND partner_id = ? AND status = 'approved'").bind(...body.earning_ids, body.partner_id).all();
+  if (!earningsRows.length) return err("No approved earnings found for that partner with those ids.", 400);
+  const total = round2(earningsRows.reduce((s, e) => s + e.amount, 0));
+  const payoutId = uuid();
+  await env.DB.prepare("INSERT INTO payouts (id, partner_id, amount, status, method, reference_note) VALUES (?, ?, ?, 'pending', ?, ?)").bind(payoutId, body.partner_id, total, body.method || null, body.reference_note || null).run();
+  for (const e of earningsRows) {
+    await env.DB.prepare("INSERT INTO payout_earnings (payout_id, earning_id) VALUES (?, ?)").bind(payoutId, e.id).run();
+    await env.DB.prepare("UPDATE earnings SET status = 'processing' WHERE id = ?").bind(e.id).run();
+  }
+  const row = await env.DB.prepare("SELECT * FROM payouts WHERE id = ?").bind(payoutId).first();
+  return json({ payout: row }, 201);
+}
+
+async function handlePayoutsAdminUpdate(request, env, id) {
+  const body = await request.json().catch(() => ({}));
+  if (!body.status) return err("status is required.");
+  await env.DB.prepare("UPDATE payouts SET status = ?, method = COALESCE(?, method), reference_note = COALESCE(?, reference_note), paid_at = CASE WHEN ? = 'paid' THEN datetime('now') ELSE paid_at END WHERE id = ?").bind(body.status, body.method || null, body.reference_note || null, body.status, id).run();
+  if (body.status === "paid") {
+    await env.DB.prepare("UPDATE earnings SET status = 'paid', paid_at = datetime('now') WHERE id IN (SELECT earning_id FROM payout_earnings WHERE payout_id = ?)").bind(id).run();
+  } else if (body.status === "failed" || body.status === "disputed") {
+    await env.DB.prepare("UPDATE earnings SET status = 'approved' WHERE id IN (SELECT earning_id FROM payout_earnings WHERE payout_id = ?) AND status = 'processing'").bind(id).run();
+  }
+  const row = await env.DB.prepare("SELECT * FROM payouts WHERE id = ?").bind(id).first();
+  return json({ payout: row });
+}
+
+async function handleBonusRulesAdminList(env) {
+  const { results } = await env.DB.prepare("SELECT * FROM bonus_rules ORDER BY created_at DESC").all();
+  return json({ bonus_rules: results });
+}
+
+async function handleBonusRulesAdminCreate(request, env) {
+  const body = await request.json().catch(() => ({}));
+  if (!body.metric || body.threshold === undefined || body.bonus_amount === undefined) return err("metric, threshold, and bonus_amount are required.");
+  const id = uuid();
+  await env.DB.prepare("INSERT INTO bonus_rules (id, campaign_id, metric, threshold, bonus_amount, description) VALUES (?, ?, ?, ?, ?, ?)").bind(id, body.campaign_id || null, body.metric, body.threshold, body.bonus_amount, body.description || null).run();
+  const row = await env.DB.prepare("SELECT * FROM bonus_rules WHERE id = ?").bind(id).first();
+  return json({ bonus_rule: row }, 201);
+}
+
+async function handleFraudFlagsAdminList(request, env) {
+  const url = new URL(request.url);
+  const status = url.searchParams.get("status") || "open";
+  const { results } = await env.DB.prepare("SELECT * FROM fraud_flags WHERE status = ? ORDER BY created_at DESC").bind(status).all();
+  return json({ fraud_flags: results, note: "Flags are for admin review only; nothing here has auto-banned a partner or withheld any payout." });
+}
+
+async function handleFraudFlagsAdminUpdate(request, env, id) {
+  const body = await request.json().catch(() => ({}));
+  if (!body.status) return err("status is required.");
+  await env.DB.prepare("UPDATE fraud_flags SET status = ?, reviewed_at = datetime('now') WHERE id = ?").bind(body.status, id).run();
+  const row = await env.DB.prepare("SELECT * FROM fraud_flags WHERE id = ?").bind(id).first();
+  return json({ fraud_flag: row });
+}
+
+async function handleContentAssignmentsAdminList(env) {
+  const { results } = await env.DB.prepare("SELECT * FROM content_assignments ORDER BY created_at DESC").all();
+  return json({ content_assignments: results });
+}
+
+async function handleContentAssignmentsAdminCreate(request, env) {
+  const body = await request.json().catch(() => ({}));
+  if (!body.campaign_id || !body.partner_id || !body.requirement_label) return err("campaign_id, partner_id, and requirement_label are required.");
+  const id = uuid();
+  await env.DB.prepare("INSERT INTO content_assignments (id, campaign_id, partner_id, requirement_label, platform, due_at) VALUES (?, ?, ?, ?, ?, ?)").bind(id, body.campaign_id, body.partner_id, body.requirement_label, body.platform || null, body.due_at || null).run();
+  const row = await env.DB.prepare("SELECT * FROM content_assignments WHERE id = ?").bind(id).first();
+  return json({ content_assignment: row }, 201);
+}
+
+async function handleContentAssignmentsAdminUpdate(request, env, id) {
+  const body = await request.json().catch(() => ({}));
+  const fields = ["status","content_id","due_at","published_at"];
+  const sets = [];
+  const binds = [];
+  for (const f of fields) { if (body[f] !== undefined) { sets.push(f + " = ?"); binds.push(body[f]); } }
+  if (!sets.length) return err("No updatable fields provided.");
+  binds.push(id);
+  await env.DB.prepare("UPDATE content_assignments SET " + sets.join(", ") + " WHERE id = ?").bind(...binds).run();
+  const row = await env.DB.prepare("SELECT * FROM content_assignments WHERE id = ?").bind(id).first();
+  return json({ content_assignment: row });
+}
+
+async function handleAdminPartnerRoutes(request, env, pathname, method) {
+  if (pathname === "/api/admin/partners/overview" && method === "GET") return handlePartnerOverview(env);
+  if (pathname === "/api/admin/partners" && method === "GET") return handlePartnerAdminList(request, env);
+  if (pathname === "/api/admin/partners" && method === "POST") return handlePartnerAdminCreate(request, env);
+  let m = pathname.match(/^\/api\/admin\/partners\/([^/]+)\/notes$/);
+  if (m && method === "POST") return handlePartnerAdminAddNote(request, env, m[1]);
+  m = pathname.match(/^\/api\/admin\/partners\/([^/]+)$/);
+  if (m && method === "GET") return handlePartnerAdminDetail(env, m[1]);
+  if (m && method === "PATCH") return handlePartnerAdminUpdate(request, env, m[1]);
+  if (pathname === "/api/admin/applications" && method === "GET") return handleApplicationsList(env);
+  m = pathname.match(/^\/api\/admin\/applications\/([^/]+)\/approve$/);
+  if (m && method === "POST") return handleApplicationApprove(request, env, m[1]);
+  m = pathname.match(/^\/api\/admin\/applications\/([^/]+)\/reject$/);
+  if (m && method === "POST") return handleApplicationReject(request, env, m[1]);
+  if (pathname === "/api/admin/campaigns" && method === "GET") return handleCampaignsAdminList(env);
+  if (pathname === "/api/admin/campaigns" && method === "POST") return handleCampaignsAdminCreate(request, env);
+  m = pathname.match(/^\/api\/admin\/campaigns\/([^/]+)\/partners$/);
+  if (m && method === "POST") return handleCampaignAddPartner(request, env, m[1]);
+  m = pathname.match(/^\/api\/admin\/campaigns\/([^/]+)$/);
+  if (m && method === "PATCH") return handleCampaignsAdminUpdate(request, env, m[1]);
+  if (pathname === "/api/admin/conversions" && method === "GET") return handleConversionsAdminList(request, env);
+  if (pathname === "/api/admin/conversions" && method === "POST") return handleConversionsAdminCreate(request, env);
+  m = pathname.match(/^\/api\/admin\/conversions\/([^/]+)$/);
+  if (m && method === "PATCH") return handleConversionsAdminUpdate(request, env, m[1]);
+  if (pathname === "/api/admin/earnings" && method === "GET") return handleEarningsAdminList(request, env);
+  m = pathname.match(/^\/api\/admin\/earnings\/([^/]+)$/);
+  if (m && method === "PATCH") return handleEarningsAdminUpdate(request, env, m[1]);
+  if (pathname === "/api/admin/payouts" && method === "GET") return handlePayoutsAdminList(request, env);
+  if (pathname === "/api/admin/payouts" && method === "POST") return handlePayoutsAdminCreate(request, env);
+  m = pathname.match(/^\/api\/admin\/payouts\/([^/]+)$/);
+  if (m && method === "PATCH") return handlePayoutsAdminUpdate(request, env, m[1]);
+  if (pathname === "/api/admin/bonus-rules" && method === "GET") return handleBonusRulesAdminList(env);
+  if (pathname === "/api/admin/bonus-rules" && method === "POST") return handleBonusRulesAdminCreate(request, env);
+  if (pathname === "/api/admin/fraud-flags" && method === "GET") return handleFraudFlagsAdminList(request, env);
+  m = pathname.match(/^\/api\/admin\/fraud-flags\/([^/]+)$/);
+  if (m && method === "PATCH") return handleFraudFlagsAdminUpdate(request, env, m[1]);
+  if (pathname === "/api/admin/content-assignments" && method === "GET") return handleContentAssignmentsAdminList(env);
+  if (pathname === "/api/admin/content-assignments" && method === "POST") return handleContentAssignmentsAdminCreate(request, env);
+  m = pathname.match(/^\/api\/admin\/content-assignments\/([^/]+)$/);
+  if (m && method === "PATCH") return handleContentAssignmentsAdminUpdate(request, env, m[1]);
+  return null;
+}
