@@ -1079,7 +1079,53 @@ async function handleContentAssignmentsAdminUpdate(request, env, id) {
   return json({ content_assignment: row });
 }
 
+async function handleSetupPartnerSchema(env) {
+  const statements = [
+  "CREATE TABLE IF NOT EXISTS partners (id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, phone TEXT, partner_type TEXT NOT NULL DEFAULT 'affiliate' CHECK (partner_type IN ('affiliate','ambassador','creator','paid_partner','vip')), status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','active','paused','rejected','terminated')), level TEXT NOT NULL DEFAULT 'new' CHECK (level IN ('new','bronze','silver','gold','elite','vip')), referral_code TEXT NOT NULL UNIQUE, dashboard_token TEXT NOT NULL UNIQUE, default_commission_pct REAL, social_links TEXT, audience_size INTEGER, location TEXT, category TEXT, notes TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')), last_active_at TEXT)",
+  "CREATE TABLE IF NOT EXISTS partner_levels (level TEXT PRIMARY KEY CHECK (level IN ('new','bronze','silver','gold','elite','vip')), min_revenue REAL NOT NULL DEFAULT 0, min_conversions INTEGER NOT NULL DEFAULT 0, commission_pct REAL, perks TEXT, sort_order INTEGER NOT NULL DEFAULT 0)",
+  "INSERT OR IGNORE INTO partner_levels (level, min_revenue, min_conversions, commission_pct, perks, sort_order) VALUES ('new', 0, 0, 5, '[\"Standard referral link\"]', 0), ('bronze', 250, 5, 7, '[\"Standard referral link\",\"Access to open campaigns\"]', 1), ('silver', 1000, 20, 10, '[\"Higher commission\",\"Early campaign access\"]', 2), ('gold', 3000, 50, 12, '[\"Higher commission\",\"Early campaign access\",\"Priority for paid campaigns\"]', 3), ('elite', 7500, 100, 15, '[\"Highest standard commission\",\"Early access\",\"Priority paid campaigns\"]', 4), ('vip', 15000, 200, 0, '[\"Individually negotiated compensation and benefits\"]', 5)",
+  "CREATE TABLE IF NOT EXISTS campaigns (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT, campaign_type TEXT NOT NULL DEFAULT 'affiliate' CHECK (campaign_type IN ('affiliate','paid_partnership','ambassador','creator_content')), status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft','open','active','paused','completed','cancelled')), commission_type TEXT NOT NULL DEFAULT 'percentage' CHECK (commission_type IN ('percentage','fixed_per_referral','fixed_per_sale','fixed_payment','custom')), commission_value REAL, fixed_payment_amount REAL, budget REAL, starts_at TEXT, ends_at TEXT, requirements TEXT, bonus_rules TEXT, eligibility TEXT, target_url TEXT NOT NULL DEFAULT '/', created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))",
+  "CREATE TABLE IF NOT EXISTS partner_applications (id TEXT PRIMARY KEY, applicant_name TEXT NOT NULL, applicant_email TEXT NOT NULL, requested_partner_type TEXT NOT NULL DEFAULT 'affiliate' CHECK (requested_partner_type IN ('affiliate','ambassador','creator','paid_partner','vip')), campaign_id TEXT REFERENCES campaigns(id) ON DELETE SET NULL, message TEXT, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')), review_notes TEXT, partner_id TEXT REFERENCES partners(id) ON DELETE SET NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT)",
+  "CREATE TABLE IF NOT EXISTS campaign_partners (campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE, partner_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE, status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','completed','removed')), commission_override_type TEXT, commission_override_value REAL, fixed_payment_override REAL, joined_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY (campaign_id, partner_id))",
+  "CREATE TABLE IF NOT EXISTS referral_links (id TEXT PRIMARY KEY, partner_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE, campaign_id TEXT REFERENCES campaigns(id) ON DELETE SET NULL, code TEXT NOT NULL UNIQUE, destination_url TEXT NOT NULL DEFAULT '/', created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+  "CREATE TABLE IF NOT EXISTS referral_clicks (id TEXT PRIMARY KEY, referral_link_id TEXT NOT NULL REFERENCES referral_links(id) ON DELETE CASCADE, ip_hash TEXT, user_agent TEXT, referer TEXT, clicked_at TEXT NOT NULL DEFAULT (datetime('now')))",
+  "CREATE TABLE IF NOT EXISTS referral_conversions (id TEXT PRIMARY KEY, referral_link_id TEXT NOT NULL REFERENCES referral_links(id) ON DELETE CASCADE, partner_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE, campaign_id TEXT REFERENCES campaigns(id) ON DELETE SET NULL, conversion_type TEXT NOT NULL CHECK (conversion_type IN ('signup','ticket_sale','membership','other_purchase')), reference_id TEXT, revenue_amount REAL NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending_review' CHECK (status IN ('pending_review','verified','rejected','flagged')), flagged_reason TEXT, occurred_at TEXT NOT NULL DEFAULT (datetime('now')), verified_at TEXT)",
+  "CREATE TABLE IF NOT EXISTS earnings (id TEXT PRIMARY KEY, partner_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE, campaign_id TEXT REFERENCES campaigns(id) ON DELETE SET NULL, conversion_id TEXT REFERENCES referral_conversions(id) ON DELETE SET NULL, earning_type TEXT NOT NULL DEFAULT 'commission' CHECK (earning_type IN ('commission','fixed_payment','bonus','adjustment')), amount REAL NOT NULL, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','processing','paid','failed','disputed')), notes TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), approved_at TEXT, paid_at TEXT)",
+  "CREATE TABLE IF NOT EXISTS payouts (id TEXT PRIMARY KEY, partner_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE, amount REAL NOT NULL, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','processing','paid','failed','disputed')), method TEXT, reference_note TEXT, requested_at TEXT NOT NULL DEFAULT (datetime('now')), paid_at TEXT)",
+  "CREATE TABLE IF NOT EXISTS payout_earnings (payout_id TEXT NOT NULL REFERENCES payouts(id) ON DELETE CASCADE, earning_id TEXT NOT NULL REFERENCES earnings(id) ON DELETE CASCADE, PRIMARY KEY (payout_id, earning_id))",
+  "CREATE TABLE IF NOT EXISTS bonus_rules (id TEXT PRIMARY KEY, campaign_id TEXT REFERENCES campaigns(id) ON DELETE CASCADE, metric TEXT NOT NULL CHECK (metric IN ('referrals','sales','revenue')), threshold REAL NOT NULL, bonus_amount REAL NOT NULL, description TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+  "CREATE TABLE IF NOT EXISTS content_assignments (id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE, partner_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE, requirement_label TEXT NOT NULL, content_id TEXT REFERENCES creator_content(id) ON DELETE SET NULL, status TEXT NOT NULL DEFAULT 'requested' CHECK (status IN ('requested','submitted','approved','revision_requested','rejected','published')), platform TEXT, due_at TEXT, submitted_at TEXT, published_at TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+  "CREATE TABLE IF NOT EXISTS partner_notes (id TEXT PRIMARY KEY, partner_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE, note TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+  "CREATE TABLE IF NOT EXISTS fraud_flags (id TEXT PRIMARY KEY, partner_id TEXT REFERENCES partners(id) ON DELETE CASCADE, referral_conversion_id TEXT REFERENCES referral_conversions(id) ON DELETE CASCADE, reason TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','reviewed_ok','reviewed_confirmed')), created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT)",
+  "CREATE INDEX IF NOT EXISTS idx_referral_links_partner ON referral_links(partner_id)",
+  "CREATE INDEX IF NOT EXISTS idx_referral_clicks_link ON referral_clicks(referral_link_id)",
+  "CREATE INDEX IF NOT EXISTS idx_referral_conversions_partner ON referral_conversions(partner_id)",
+  "CREATE INDEX IF NOT EXISTS idx_referral_conversions_link ON referral_conversions(referral_link_id)",
+  "CREATE INDEX IF NOT EXISTS idx_earnings_partner ON earnings(partner_id)",
+  "CREATE INDEX IF NOT EXISTS idx_earnings_status ON earnings(status)",
+  "CREATE INDEX IF NOT EXISTS idx_payouts_partner ON payouts(partner_id)",
+  "CREATE INDEX IF NOT EXISTS idx_partner_applications_status ON partner_applications(status)",
+  "CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status)",
+  "CREATE INDEX IF NOT EXISTS idx_content_assignments_campaign ON content_assignments(campaign_id)",
+  "CREATE INDEX IF NOT EXISTS idx_content_assignments_partner ON content_assignments(partner_id)",
+  "CREATE INDEX IF NOT EXISTS idx_fraud_flags_status ON fraud_flags(status)"
+  ];
+  const results = [];
+  for (const sql of statements) {
+    try {
+      await env.DB.prepare(sql).run();
+      results.push({ ok: true, statement: sql.slice(0, 70) });
+    } catch (e) {
+      results.push({ ok: false, statement: sql.slice(0, 70), error: String((e && e.message) || e) });
+    }
+  }
+  const failed = results.filter(function (r) { return !r.ok; });
+  return json({ ok: failed.length === 0, total: statements.length, failed: failed.length, results: results });
+}
+
 async function handleAdminPartnerRoutes(request, env, pathname, method) {
+  if (pathname === "/api/admin/setup-partner-schema" && method === "POST") return handleSetupPartnerSchema(env);
+
   if (pathname === "/api/admin/partners/overview" && method === "GET") return handlePartnerOverview(env);
   if (pathname === "/api/admin/partners" && method === "GET") return handlePartnerAdminList(request, env);
   if (pathname === "/api/admin/partners" && method === "POST") return handlePartnerAdminCreate(request, env);
