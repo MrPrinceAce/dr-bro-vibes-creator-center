@@ -745,6 +745,465 @@ async function handlePartnerContentAssignmentSubmit(request, env, id) {
   return json({ assignment: row });
 }
 
+
+// ---------- Creator/Influencer Recommendation System: schema setup ----------
+
+async function handleSetupRecommendationSchema(env) {
+  const statements = [
+    "ALTER TABLE partners ADD COLUMN bio TEXT",
+    "ALTER TABLE partners ADD COLUMN languages TEXT",
+    "ALTER TABLE partners ADD COLUMN availability TEXT",
+    "ALTER TABLE partners ADD COLUMN rate_min REAL",
+    "ALTER TABLE partners ADD COLUMN rate_max REAL",
+    "ALTER TABLE partners ADD COLUMN account_verified INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE partners ADD COLUMN identity_verified INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE partners ADD COLUMN creator_verified INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE partners ADD COLUMN verification_updated_at TEXT",
+    "CREATE TABLE IF NOT EXISTS content_categories (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, is_active INTEGER NOT NULL DEFAULT 1, sort_order INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+    "CREATE TABLE IF NOT EXISTS partner_categories (id TEXT PRIMARY KEY, partner_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE, category_id TEXT NOT NULL REFERENCES content_categories(id) ON DELETE CASCADE, UNIQUE(partner_id, category_id))",
+    "CREATE TABLE IF NOT EXISTS partner_platforms (id TEXT PRIMARY KEY, partner_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE, platform TEXT NOT NULL CHECK (platform IN ('instagram','facebook','youtube','tiktok','other')), handle_or_url TEXT, follower_count INTEGER, engagement_rate REAL, updated_at TEXT NOT NULL DEFAULT (datetime('now')), UNIQUE(partner_id, platform))",
+    "ALTER TABLE campaigns ADD COLUMN required_categories TEXT",
+    "ALTER TABLE campaigns ADD COLUMN required_platforms TEXT",
+    "ALTER TABLE campaigns ADD COLUMN required_location TEXT",
+    "ALTER TABLE campaigns ADD COLUMN required_language TEXT",
+    "ALTER TABLE campaigns ADD COLUMN deliverables TEXT",
+    "CREATE TABLE IF NOT EXISTS opportunity_applications (id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE, partner_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE, status TEXT NOT NULL DEFAULT 'applied' CHECK (status IN ('applied','reviewing','accepted','declined','withdrawn')), message TEXT, applied_at TEXT NOT NULL DEFAULT (datetime('now')), decided_at TEXT, UNIQUE(campaign_id, partner_id))",
+    "CREATE TABLE IF NOT EXISTS creator_connections (id TEXT PRIMARY KEY, partner_a_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE, partner_b_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE, requested_by TEXT NOT NULL REFERENCES partners(id), met_city TEXT, met_country TEXT, met_date TEXT, status TEXT NOT NULL DEFAULT 'requested' CHECK (status IN ('requested','accepted','declined')), notes TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')), decided_at TEXT)",
+    "CREATE TABLE IF NOT EXISTS verification_codes (id TEXT PRIMARY KEY, partner_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE, code TEXT NOT NULL UNIQUE, expires_at TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')), used_at TEXT, used_by_partner_id TEXT REFERENCES partners(id))",
+    "ALTER TABLE content_assignments ADD COLUMN disclosure_type TEXT",
+    "ALTER TABLE content_assignments ADD COLUMN disclosure_confirmed_at TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_partner_categories_partner ON partner_categories(partner_id)",
+    "CREATE INDEX IF NOT EXISTS idx_partner_categories_category ON partner_categories(category_id)",
+    "CREATE INDEX IF NOT EXISTS idx_partner_platforms_partner ON partner_platforms(partner_id)",
+    "CREATE INDEX IF NOT EXISTS idx_opportunity_applications_campaign ON opportunity_applications(campaign_id)",
+    "CREATE INDEX IF NOT EXISTS idx_opportunity_applications_partner ON opportunity_applications(partner_id)",
+    "CREATE INDEX IF NOT EXISTS idx_creator_connections_a ON creator_connections(partner_a_id)",
+    "CREATE INDEX IF NOT EXISTS idx_creator_connections_b ON creator_connections(partner_b_id)",
+    "CREATE INDEX IF NOT EXISTS idx_verification_codes_partner ON verification_codes(partner_id)",
+    "CREATE INDEX IF NOT EXISTS idx_verification_codes_code ON verification_codes(code)",
+    "INSERT OR IGNORE INTO content_categories (id, name, sort_order) VALUES ('cat-travel','Travel',1),('cat-lifestyle','Lifestyle',2),('cat-fashion','Fashion',3),('cat-fitness','Fitness',4),('cat-food','Food',5),('cat-entertainment','Entertainment',6),('cat-photography','Photography',7),('cat-video','Video',8),('cat-technology','Technology',9),('cat-other','Other',10)"
+  ];
+  const results = [];
+  for (const sql of statements) {
+    try {
+      await env.DB.prepare(sql).run();
+      results.push({ ok: true, statement: sql.slice(0, 70) });
+    } catch (e) {
+      results.push({ ok: false, statement: sql.slice(0, 70), error: String((e && e.message) || e) });
+    }
+  }
+  const failed = results.filter((r) => !r.ok).length;
+  return json({ ok: failed === 0, total: results.length, failed, results });
+}
+
+// ---------- Creator/Influencer Recommendation Engine ----------
+// Transparent, rule-based scoring. Weights are defined once here so an
+// admin settings screen can change them later without touching the engine.
+// If a factor's underlying data is missing, it is EXCLUDED from scoring
+// (not penalized to zero) and the score is renormalized across the
+// factors that *do* have data -- this keeps new creators with little or
+// no history from being unfairly buried at the bottom.
+
+const RECOMMENDATION_WEIGHTS = {
+  category: 30,
+  audience: 25,
+  performance: 20,
+  platform: 10,
+  location_language: 10,
+  availability: 5,
+};
+
+function safeJsonArray(text) {
+  if (!text) return [];
+  try {
+    const v = JSON.parse(text);
+    return Array.isArray(v) ? v : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+async function getPartnerCategoryNames(env, partnerId) {
+  const res = await env.DB.prepare(
+    "SELECT cc.name AS name FROM partner_categories pc JOIN content_categories cc ON cc.id = pc.category_id WHERE pc.partner_id = ?"
+  ).bind(partnerId).all();
+  return (res.results || []).map((r) => r.name);
+}
+
+async function getPartnerPlatformRows(env, partnerId) {
+  const res = await env.DB.prepare("SELECT * FROM partner_platforms WHERE partner_id = ?").bind(partnerId).all();
+  return res.results || [];
+}
+
+async function computeCreatorCampaignMatch(env, partner, campaign) {
+  const factors = [];
+
+  const requiredCategories = safeJsonArray(campaign.required_categories).map((c) => String(c).toLowerCase());
+  const partnerCategoryNames = (await getPartnerCategoryNames(env, partner.id)).map((c) => c.toLowerCase());
+  if (partner.category) partnerCategoryNames.push(String(partner.category).toLowerCase());
+  if (requiredCategories.length === 0) {
+    factors.push({ key: "category", label: "Category match", weight: RECOMMENDATION_WEIGHTS.category, applicable: false, reason: "Opportunity did not specify required categories." });
+  } else if (partnerCategoryNames.length === 0) {
+    factors.push({ key: "category", label: "Category match", weight: RECOMMENDATION_WEIGHTS.category, applicable: false, reason: "Not enough data -- creator has not selected any content categories yet." });
+  } else {
+    const overlap = requiredCategories.filter((c) => partnerCategoryNames.includes(c));
+    const earned = requiredCategories.length ? (overlap.length / requiredCategories.length) * RECOMMENDATION_WEIGHTS.category : 0;
+    factors.push({ key: "category", label: "Category match", weight: RECOMMENDATION_WEIGHTS.category, applicable: true, earned, matched: overlap, detail: overlap.length ? ("Matches: " + overlap.join(", ")) : "No overlapping categories." });
+  }
+
+  if (!partner.audience_size) {
+    factors.push({ key: "audience", label: "Audience match", weight: RECOMMENDATION_WEIGHTS.audience, applicable: false, reason: "Not enough data -- no audience size on file for this creator." });
+  } else {
+    const size = Number(partner.audience_size) || 0;
+    const scale = Math.min(1, size / 10000);
+    const earned = scale * RECOMMENDATION_WEIGHTS.audience;
+    factors.push({ key: "audience", label: "Audience match", weight: RECOMMENDATION_WEIGHTS.audience, applicable: true, earned, detail: size.toLocaleString() + " recorded audience size (proxy only -- detailed audience demographics are not collected)." });
+  }
+
+  const perf = await env.DB.prepare(
+    "SELECT COUNT(*) AS cnt, COALESCE(SUM(revenue_amount),0) AS rev FROM referral_conversions WHERE partner_id = ? AND status = 'verified'"
+  ).bind(partner.id).first();
+  const verifiedCount = (perf && perf.cnt) || 0;
+  if (verifiedCount === 0) {
+    factors.push({ key: "performance", label: "Performance / engagement", weight: RECOMMENDATION_WEIGHTS.performance, applicable: false, reason: "Not enough historical performance data yet -- this does not count against a new creator.", newCreator: true });
+  } else {
+    const scale = Math.min(1, verifiedCount / 20);
+    const earned = scale * RECOMMENDATION_WEIGHTS.performance;
+    factors.push({ key: "performance", label: "Performance / engagement", weight: RECOMMENDATION_WEIGHTS.performance, applicable: true, earned, detail: verifiedCount + " verified conversion(s) on record." });
+  }
+
+  const requiredPlatforms = safeJsonArray(campaign.required_platforms).map((p) => String(p).toLowerCase());
+  const partnerPlatformRows = await getPartnerPlatformRows(env, partner.id);
+  const partnerPlatforms = partnerPlatformRows.map((p) => String(p.platform).toLowerCase());
+  if (requiredPlatforms.length === 0) {
+    factors.push({ key: "platform", label: "Platform match", weight: RECOMMENDATION_WEIGHTS.platform, applicable: false, reason: "Opportunity did not specify required platforms." });
+  } else if (partnerPlatforms.length === 0) {
+    factors.push({ key: "platform", label: "Platform match", weight: RECOMMENDATION_WEIGHTS.platform, applicable: false, reason: "Not enough data -- creator has not added any platforms yet." });
+  } else {
+    const overlap = requiredPlatforms.filter((p) => partnerPlatforms.includes(p));
+    const earned = requiredPlatforms.length ? (overlap.length / requiredPlatforms.length) * RECOMMENDATION_WEIGHTS.platform : 0;
+    factors.push({ key: "platform", label: "Platform match", weight: RECOMMENDATION_WEIGHTS.platform, applicable: true, earned, matched: overlap, detail: overlap.length ? ("Has: " + overlap.join(", ")) : "No overlapping platforms." });
+  }
+
+  const locReq = (campaign.required_location || "").toLowerCase().trim();
+  const langReq = (campaign.required_language || "").toLowerCase().trim();
+  const partnerLangs = safeJsonArray(partner.languages).map((l) => String(l).toLowerCase());
+  if (!locReq && !langReq) {
+    factors.push({ key: "location_language", label: "Location / language", weight: RECOMMENDATION_WEIGHTS.location_language, applicable: false, reason: "Opportunity did not specify location or language requirements." });
+  } else {
+    let subScores = [];
+    if (locReq) {
+      if (!partner.location) { subScores.push(0); } else { subScores.push(partner.location.toLowerCase().indexOf(locReq) !== -1 ? 1 : 0); }
+    }
+    if (langReq) {
+      if (!partnerLangs.length) { subScores.push(0); } else { subScores.push(partnerLangs.includes(langReq) ? 1 : 0); }
+    }
+    const avg = subScores.length ? subScores.reduce((a, b) => a + b, 0) / subScores.length : 0;
+    const earned = avg * RECOMMENDATION_WEIGHTS.location_language;
+    factors.push({ key: "location_language", label: "Location / language", weight: RECOMMENDATION_WEIGHTS.location_language, applicable: true, earned, detail: "Location match: " + (locReq ? (partner.location || "not on file") : "not required") + "; Language match: " + (langReq ? (partnerLangs.join(", ") || "not on file") : "not required") });
+  }
+
+  if (!partner.availability) {
+    factors.push({ key: "availability", label: "Availability", weight: RECOMMENDATION_WEIGHTS.availability, applicable: false, reason: "Not enough data -- creator has not set an availability status." });
+  } else {
+    const avail = String(partner.availability).toLowerCase();
+    const scale = avail === "available" ? 1 : avail === "limited" ? 0.5 : 0;
+    factors.push({ key: "availability", label: "Availability", weight: RECOMMENDATION_WEIGHTS.availability, applicable: true, earned: scale * RECOMMENDATION_WEIGHTS.availability, detail: "Creator-reported availability: " + partner.availability });
+  }
+
+  const applicableFactors = factors.filter((f) => f.applicable);
+  const totalWeight = applicableFactors.reduce((sum, f) => sum + f.weight, 0);
+  const totalEarned = applicableFactors.reduce((sum, f) => sum + f.earned, 0);
+  const score = totalWeight > 0 ? Math.round((totalEarned / totalWeight) * 100) : null;
+
+  let label = "Not enough data to score";
+  if (score !== null) {
+    if (score >= 75) label = "Strong match";
+    else if (score >= 50) label = "Good match";
+    else if (score >= 25) label = "Possible match";
+    else label = "Low match";
+  }
+
+  return {
+    score,
+    label,
+    factors,
+    new_creator: factors.some((f) => f.newCreator),
+    note: "Rule-based estimate for admin/partner review only. Missing data is excluded from scoring rather than penalized, so new creators remain eligible.",
+  };
+}
+
+// ---------- Content categories (admin-managed) ----------
+
+async function handleCategoriesList(env, activeOnly) {
+  const sql = activeOnly ? "SELECT * FROM content_categories WHERE is_active = 1 ORDER BY sort_order ASC, name ASC" : "SELECT * FROM content_categories ORDER BY sort_order ASC, name ASC";
+  const { results } = await env.DB.prepare(sql).all();
+  return json({ categories: results });
+}
+
+async function handleCategoriesAdminCreate(request, env) {
+  const body = await request.json().catch(() => ({}));
+  if (!body.name) return err("name is required.");
+  const id = uuid();
+  await env.DB.prepare("INSERT INTO content_categories (id, name, sort_order) VALUES (?, ?, ?)").bind(id, body.name, body.sort_order || 0).run();
+  const row = await env.DB.prepare("SELECT * FROM content_categories WHERE id = ?").bind(id).first();
+  return json({ category: row }, 201);
+}
+
+async function handleCategoriesAdminUpdate(request, env, id) {
+  const body = await request.json().catch(() => ({}));
+  const existing = await env.DB.prepare("SELECT * FROM content_categories WHERE id = ?").bind(id).first();
+  if (!existing) return err("Category not found.", 404);
+  const name = body.name !== undefined ? body.name : existing.name;
+  const isActive = body.is_active !== undefined ? (body.is_active ? 1 : 0) : existing.is_active;
+  const sortOrder = body.sort_order !== undefined ? body.sort_order : existing.sort_order;
+  await env.DB.prepare("UPDATE content_categories SET name = ?, is_active = ?, sort_order = ? WHERE id = ?").bind(name, isActive, sortOrder, id).run();
+  const row = await env.DB.prepare("SELECT * FROM content_categories WHERE id = ?").bind(id).first();
+  return json({ category: row });
+}
+
+// ---------- Creator (partner) self-service profile ----------
+
+async function handlePartnerProfileGet(env, partner) {
+  const categories = await getPartnerCategoryNames(env, partner.id);
+  const platforms = await getPartnerPlatformRows(env, partner.id);
+  return json({ partner, categories, platforms });
+}
+
+async function handlePartnerProfileUpdate(request, env, partner) {
+  const body = await request.json().catch(() => ({}));
+  const fields = ["bio", "availability", "location", "category", "social_links", "audience_size"];
+  const sets = [];
+  const binds = [];
+  fields.forEach((f) => {
+    if (body[f] !== undefined) { sets.push(f + " = ?"); binds.push(body[f]); }
+  });
+  if (body.languages !== undefined) { sets.push("languages = ?"); binds.push(JSON.stringify(body.languages || [])); }
+  if (body.rate_min !== undefined) { sets.push("rate_min = ?"); binds.push(body.rate_min); }
+  if (body.rate_max !== undefined) { sets.push("rate_max = ?"); binds.push(body.rate_max); }
+  if (sets.length === 0) return err("No recognized fields to update.");
+  sets.push("updated_at = datetime('now')");
+  binds.push(partner.id);
+  await env.DB.prepare("UPDATE partners SET " + sets.join(", ") + " WHERE id = ?").bind(...binds).run();
+  const row = await env.DB.prepare("SELECT * FROM partners WHERE id = ?").bind(partner.id).first();
+  return json({ partner: row });
+}
+
+async function handlePartnerCategoriesSet(request, env, partner) {
+  const body = await request.json().catch(() => ({}));
+  const categoryIds = Array.isArray(body.category_ids) ? body.category_ids : [];
+  await env.DB.prepare("DELETE FROM partner_categories WHERE partner_id = ?").bind(partner.id).run();
+  for (const catId of categoryIds) {
+    try {
+      await env.DB.prepare("INSERT INTO partner_categories (id, partner_id, category_id) VALUES (?, ?, ?)").bind(uuid(), partner.id, catId).run();
+    } catch (e) { /* skip invalid category id */ }
+  }
+  const categories = await getPartnerCategoryNames(env, partner.id);
+  return json({ categories });
+}
+
+async function handlePartnerPlatformUpsert(request, env, partner) {
+  const body = await request.json().catch(() => ({}));
+  if (!body.platform) return err("platform is required.");
+  const existing = await env.DB.prepare("SELECT * FROM partner_platforms WHERE partner_id = ? AND platform = ?").bind(partner.id, body.platform).first();
+  if (existing) {
+    await env.DB.prepare("UPDATE partner_platforms SET handle_or_url = ?, follower_count = ?, engagement_rate = ?, updated_at = datetime('now') WHERE id = ?").bind(body.handle_or_url || null, body.follower_count != null ? body.follower_count : null, body.engagement_rate != null ? body.engagement_rate : null, existing.id).run();
+  } else {
+    await env.DB.prepare("INSERT INTO partner_platforms (id, partner_id, platform, handle_or_url, follower_count, engagement_rate) VALUES (?, ?, ?, ?, ?, ?)").bind(uuid(), partner.id, body.platform, body.handle_or_url || null, body.follower_count != null ? body.follower_count : null, body.engagement_rate != null ? body.engagement_rate : null).run();
+  }
+  const platforms = await getPartnerPlatformRows(env, partner.id);
+  return json({ platforms });
+}
+
+// ---------- Opportunity (campaign) requirements ----------
+
+async function handleCampaignRequirementsUpdate(request, env, id) {
+  const body = await request.json().catch(() => ({}));
+  const existing = await env.DB.prepare("SELECT * FROM campaigns WHERE id = ?").bind(id).first();
+  if (!existing) return err("Campaign not found.", 404);
+  const requiredCategories = body.required_categories !== undefined ? JSON.stringify(body.required_categories || []) : existing.required_categories;
+  const requiredPlatforms = body.required_platforms !== undefined ? JSON.stringify(body.required_platforms || []) : existing.required_platforms;
+  const requiredLocation = body.required_location !== undefined ? body.required_location : existing.required_location;
+  const requiredLanguage = body.required_language !== undefined ? body.required_language : existing.required_language;
+  const deliverables = body.deliverables !== undefined ? JSON.stringify(body.deliverables || []) : existing.deliverables;
+  await env.DB.prepare("UPDATE campaigns SET required_categories = ?, required_platforms = ?, required_location = ?, required_language = ?, deliverables = ?, updated_at = datetime('now') WHERE id = ?").bind(requiredCategories, requiredPlatforms, requiredLocation, requiredLanguage, deliverables, id).run();
+  const row = await env.DB.prepare("SELECT * FROM campaigns WHERE id = ?").bind(id).first();
+  return json({ campaign: row });
+}
+
+// ---------- Two-way recommendation endpoints ----------
+
+async function handleCampaignRecommendedCreators(env, campaignId) {
+  const campaign = await env.DB.prepare("SELECT * FROM campaigns WHERE id = ?").bind(campaignId).first();
+  if (!campaign) return err("Opportunity not found.", 404);
+  const { results: partners } = await env.DB.prepare("SELECT * FROM partners WHERE status = 'active'").all();
+  const matches = [];
+  for (const p of partners) {
+    const m = await computeCreatorCampaignMatch(env, p, campaign);
+    matches.push({ partner_id: p.id, partner_name: p.name, level: p.level, score: m.score, label: m.label, new_creator: m.new_creator, factors: m.factors });
+  }
+  matches.sort((a, b) => (b.score == null ? -1 : b.score) - (a.score == null ? -1 : a.score));
+  return json({ campaign_id: campaignId, campaign_name: campaign.name, matches, note: "Rule-based recommendations for admin/partner review. Not a guarantee of fit or approval." });
+}
+
+async function handlePartnerRecommendedOpportunities(env, partner) {
+  const { results: campaigns } = await env.DB.prepare("SELECT * FROM campaigns WHERE status IN ('open','active')").all();
+  const matches = [];
+  for (const c of campaigns) {
+    const m = await computeCreatorCampaignMatch(env, partner, c);
+    matches.push({ campaign_id: c.id, campaign_name: c.name, campaign_type: c.campaign_type, budget: c.budget, score: m.score, label: m.label, new_creator: m.new_creator, factors: m.factors });
+  }
+  matches.sort((a, b) => (b.score == null ? -1 : b.score) - (a.score == null ? -1 : a.score));
+  return json({ partner_id: partner.id, matches, note: "Rule-based recommendations for your review. Applying is not guaranteed acceptance." });
+}
+
+// ---------- Opportunity applications ----------
+
+async function handleOpportunityApplicationCreate(request, env, partner, campaignId) {
+  const body = await request.json().catch(() => ({}));
+  const campaign = await env.DB.prepare("SELECT * FROM campaigns WHERE id = ?").bind(campaignId).first();
+  if (!campaign) return err("Opportunity not found.", 404);
+  const existing = await env.DB.prepare("SELECT * FROM opportunity_applications WHERE campaign_id = ? AND partner_id = ?").bind(campaignId, partner.id).first();
+  if (existing) return err("You have already applied to this opportunity.", 409);
+  const id = uuid();
+  await env.DB.prepare("INSERT INTO opportunity_applications (id, campaign_id, partner_id, status, message) VALUES (?, ?, ?, 'applied', ?)").bind(id, campaignId, partner.id, body.message || null).run();
+  const row = await env.DB.prepare("SELECT * FROM opportunity_applications WHERE id = ?").bind(id).first();
+  return json({ application: row }, 201);
+}
+
+async function handlePartnerApplicationsList(env, partner) {
+  const { results } = await env.DB.prepare(
+    "SELECT oa.*, c.name AS campaign_name FROM opportunity_applications oa JOIN campaigns c ON c.id = oa.campaign_id WHERE oa.partner_id = ? ORDER BY oa.applied_at DESC"
+  ).bind(partner.id).all();
+  return json({ applications: results });
+}
+
+async function handleOpportunityApplicationsAdminList(env, campaignId) {
+  const sql = campaignId
+    ? "SELECT oa.*, p.name AS partner_name, c.name AS campaign_name FROM opportunity_applications oa JOIN partners p ON p.id = oa.partner_id JOIN campaigns c ON c.id = oa.campaign_id WHERE oa.campaign_id = ? ORDER BY oa.applied_at DESC"
+    : "SELECT oa.*, p.name AS partner_name, c.name AS campaign_name FROM opportunity_applications oa JOIN partners p ON p.id = oa.partner_id JOIN campaigns c ON c.id = oa.campaign_id ORDER BY oa.applied_at DESC";
+  const stmt = campaignId ? env.DB.prepare(sql).bind(campaignId) : env.DB.prepare(sql);
+  const { results } = await stmt.all();
+  return json({ applications: results });
+}
+
+async function handleOpportunityApplicationAdminUpdate(request, env, id) {
+  const body = await request.json().catch(() => ({}));
+  const app = await env.DB.prepare("SELECT * FROM opportunity_applications WHERE id = ?").bind(id).first();
+  if (!app) return err("Application not found.", 404);
+  const status = body.status;
+  if (!["applied", "reviewing", "accepted", "declined", "withdrawn"].includes(status)) return err("Invalid status.");
+  await env.DB.prepare("UPDATE opportunity_applications SET status = ?, decided_at = datetime('now') WHERE id = ?").bind(status, id).run();
+  if (status === "accepted") {
+    await env.DB.prepare("INSERT OR IGNORE INTO campaign_partners (campaign_id, partner_id) VALUES (?, ?)").bind(app.campaign_id, app.partner_id).run();
+  }
+  const row = await env.DB.prepare("SELECT * FROM opportunity_applications WHERE id = ?").bind(id).first();
+  return json({ application: row });
+}
+
+// ---------- Consent-based creator verification (no facial recognition, no biometrics) ----------
+// A creator generates a short-lived code and shows it (e.g. as a QR code
+// rendered client-side) to someone they are meeting in person. The other
+// person scans/enters the code from their OWN account to confirm they saw
+// it. This only proves account presence/control -- it never captures or
+// stores any photo, face, or biometric data.
+
+function generateShortCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let out = "";
+  for (let i = 0; i < 6; i++) out += chars[Math.floor(Math.random() * chars.length)];
+  return out;
+}
+
+async function handleVerificationCodeCreate(env, partner) {
+  const code = generateShortCode();
+  const id = uuid();
+  const expiresAt = new Date(Date.now() + 15 * 60000).toISOString();
+  await env.DB.prepare("INSERT INTO verification_codes (id, partner_id, code, expires_at) VALUES (?, ?, ?, ?)").bind(id, partner.id, code, expiresAt).run();
+  return json({
+    code,
+    expires_at: expiresAt,
+    partner: { id: partner.id, name: partner.name, creator_verified: !!partner.creator_verified, account_verified: !!partner.account_verified },
+    note: "Show this code (e.g. as a QR code) to the person you're meeting. It expires in 15 minutes and proves account presence only -- no photo or biometric data is involved.",
+  });
+}
+
+async function handleVerificationCodeScan(request, env, scanningPartner) {
+  const body = await request.json().catch(() => ({}));
+  if (!body.code) return err("code is required.");
+  const row = await env.DB.prepare("SELECT * FROM verification_codes WHERE code = ?").bind(String(body.code).toUpperCase()).first();
+  if (!row) return err("Invalid code.", 404);
+  if (row.used_at) return err("This code has already been used.", 409);
+  if (new Date(row.expires_at).getTime() < Date.now()) return err("This code has expired.", 410);
+  if (row.partner_id === scanningPartner.id) return err("You cannot scan your own verification code.");
+  await env.DB.prepare("UPDATE verification_codes SET used_at = datetime('now'), used_by_partner_id = ? WHERE id = ?").bind(scanningPartner.id, row.id).run();
+  const owner = await env.DB.prepare("SELECT * FROM partners WHERE id = ?").bind(row.partner_id).first();
+  if (owner && !owner.account_verified) {
+    await env.DB.prepare("UPDATE partners SET account_verified = 1, verification_updated_at = datetime('now') WHERE id = ?").bind(owner.id).run();
+  }
+  return json({
+    verified: true,
+    creator: owner ? { id: owner.id, name: owner.name, partner_type: owner.partner_type, level: owner.level, account_verified: true, creator_verified: !!(owner && owner.creator_verified) } : null,
+    note: "Account presence confirmed by scan. This is not identity/biometric verification.",
+  });
+}
+
+// ---------- Creator connections (meet in person -> mutual opt-in connect) ----------
+
+async function handleConnectionCreate(request, env, partner) {
+  const body = await request.json().catch(() => ({}));
+  if (!body.to_partner_id) return err("to_partner_id is required.");
+  if (body.to_partner_id === partner.id) return err("You cannot connect with yourself.");
+  const other = await env.DB.prepare("SELECT * FROM partners WHERE id = ?").bind(body.to_partner_id).first();
+  if (!other) return err("Creator not found.", 404);
+  const id = uuid();
+  await env.DB.prepare(
+    "INSERT INTO creator_connections (id, partner_a_id, partner_b_id, requested_by, met_city, met_country, met_date, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).bind(id, partner.id, other.id, partner.id, body.met_city || null, body.met_country || null, body.met_date || null, body.notes || null).run();
+  const row = await env.DB.prepare("SELECT * FROM creator_connections WHERE id = ?").bind(id).first();
+  return json({ connection: row }, 201);
+}
+
+async function handleConnectionsList(env, partner) {
+  const { results } = await env.DB.prepare(
+    "SELECT cc.*, pa.name AS partner_a_name, pb.name AS partner_b_name FROM creator_connections cc JOIN partners pa ON pa.id = cc.partner_a_id JOIN partners pb ON pb.id = cc.partner_b_id WHERE cc.partner_a_id = ? OR cc.partner_b_id = ? ORDER BY cc.created_at DESC"
+  ).bind(partner.id, partner.id).all();
+  return json({ connections: results });
+}
+
+async function handleConnectionRespond(request, env, partner, id) {
+  const body = await request.json().catch(() => ({}));
+  const conn = await env.DB.prepare("SELECT * FROM creator_connections WHERE id = ?").bind(id).first();
+  if (!conn) return err("Connection not found.", 404);
+  if (conn.partner_b_id !== partner.id) return err("Only the invited creator can respond to this connection request.", 403);
+  const action = body.action;
+  if (!["accept", "decline"].includes(action)) return err("action must be accept or decline.");
+  const status = action === "accept" ? "accepted" : "declined";
+  await env.DB.prepare("UPDATE creator_connections SET status = ?, decided_at = datetime('now') WHERE id = ?").bind(status, id).run();
+  const row = await env.DB.prepare("SELECT * FROM creator_connections WHERE id = ?").bind(id).first();
+  return json({ connection: row });
+}
+
+async function handleConnectionsAdminList(env) {
+  const { results } = await env.DB.prepare(
+    "SELECT cc.*, pa.name AS partner_a_name, pb.name AS partner_b_name FROM creator_connections cc JOIN partners pa ON pa.id = cc.partner_a_id JOIN partners pb ON pb.id = cc.partner_b_id ORDER BY cc.created_at DESC"
+  ).all();
+  return json({ connections: results });
+}
+
+// ---------- Partnership disclosures (FTC-style: sponsored/affiliate/free product/other) ----------
+
+async function handleContentAssignmentDisclosureSet(request, env, partner, id) {
+  const body = await request.json().catch(() => ({}));
+  const allowed = ["sponsored", "affiliate", "free_product", "other"];
+  if (!allowed.includes(body.disclosure_type)) return err("disclosure_type must be one of: " + allowed.join(", "));
+  const assignment = await env.DB.prepare("SELECT * FROM content_assignments WHERE id = ?").bind(id).first();
+  if (!assignment) return err("Content assignment not found.", 404);
+  if (assignment.partner_id !== partner.id) return err("You can only set disclosures on your own content assignments.", 403);
+  await env.DB.prepare("UPDATE content_assignments SET disclosure_type = ?, disclosure_confirmed_at = datetime('now') WHERE id = ?").bind(body.disclosure_type, id).run();
+  const row = await env.DB.prepare("SELECT * FROM content_assignments WHERE id = ?").bind(id).first();
+  return json({ content_assignment: row });
+}
 async function handlePublicPartnerRoutes(request, env, pathname, method) {
   if (pathname === "/api/public/earn-money" && method === "GET") return handleEarnMoneyList(env);
   if (pathname === "/api/public/partner-applications" && method === "POST") return handlePartnerApplicationCreate(request, env);
@@ -752,7 +1211,78 @@ async function handlePublicPartnerRoutes(request, env, pathname, method) {
   if (pathname === "/api/partner/referral-links" && method === "POST") return handlePartnerReferralLinkCreate(request, env);
   const am = pathname.match(/^\/api\/partner\/content-assignments\/([^/]+)\/submit$/);
   if (am && method === "POST") return handlePartnerContentAssignmentSubmit(request, env, am[1]);
-  return null;
+  
+  if (pathname === "/api/partner/categories" && method === "GET") return handleCategoriesList(env, true);
+
+  if (pathname === "/api/partner/profile" && method === "GET") {
+    const partner = await getPartnerByToken(env, partnerTokenFromRequest(request));
+    if (!partner) return err("Invalid or missing partner token.", 401);
+    return handlePartnerProfileGet(env, partner);
+  }
+  if (pathname === "/api/partner/profile" && method === "PATCH") {
+    const partner = await getPartnerByToken(env, partnerTokenFromRequest(request));
+    if (!partner) return err("Invalid or missing partner token.", 401);
+    return handlePartnerProfileUpdate(request, env, partner);
+  }
+  if (pathname === "/api/partner/categories/set" && method === "POST") {
+    const partner = await getPartnerByToken(env, partnerTokenFromRequest(request));
+    if (!partner) return err("Invalid or missing partner token.", 401);
+    return handlePartnerCategoriesSet(request, env, partner);
+  }
+  if (pathname === "/api/partner/platforms" && method === "POST") {
+    const partner = await getPartnerByToken(env, partnerTokenFromRequest(request));
+    if (!partner) return err("Invalid or missing partner token.", 401);
+    return handlePartnerPlatformUpsert(request, env, partner);
+  }
+  if (pathname === "/api/partner/opportunities/recommended" && method === "GET") {
+    const partner = await getPartnerByToken(env, partnerTokenFromRequest(request));
+    if (!partner) return err("Invalid or missing partner token.", 401);
+    return handlePartnerRecommendedOpportunities(env, partner);
+  }
+  let oppApplyMatch = pathname.match(/^\/api\/partner\/opportunities\/([^/]+)\/apply$/);
+  if (oppApplyMatch && method === "POST") {
+    const partner = await getPartnerByToken(env, partnerTokenFromRequest(request));
+    if (!partner) return err("Invalid or missing partner token.", 401);
+    return handleOpportunityApplicationCreate(request, env, partner, oppApplyMatch[1]);
+  }
+  if (pathname === "/api/partner/applications" && method === "GET") {
+    const partner = await getPartnerByToken(env, partnerTokenFromRequest(request));
+    if (!partner) return err("Invalid or missing partner token.", 401);
+    return handlePartnerApplicationsList(env, partner);
+  }
+  if (pathname === "/api/partner/verification/code" && method === "POST") {
+    const partner = await getPartnerByToken(env, partnerTokenFromRequest(request));
+    if (!partner) return err("Invalid or missing partner token.", 401);
+    return handleVerificationCodeCreate(env, partner);
+  }
+  if (pathname === "/api/partner/verification/scan" && method === "POST") {
+    const partner = await getPartnerByToken(env, partnerTokenFromRequest(request));
+    if (!partner) return err("Invalid or missing partner token.", 401);
+    return handleVerificationCodeScan(request, env, partner);
+  }
+  if (pathname === "/api/partner/connections" && method === "POST") {
+    const partner = await getPartnerByToken(env, partnerTokenFromRequest(request));
+    if (!partner) return err("Invalid or missing partner token.", 401);
+    return handleConnectionCreate(request, env, partner);
+  }
+  if (pathname === "/api/partner/connections" && method === "GET") {
+    const partner = await getPartnerByToken(env, partnerTokenFromRequest(request));
+    if (!partner) return err("Invalid or missing partner token.", 401);
+    return handleConnectionsList(env, partner);
+  }
+  let connRespondMatch = pathname.match(/^\/api\/partner\/connections\/([^/]+)$/);
+  if (connRespondMatch && method === "PATCH") {
+    const partner = await getPartnerByToken(env, partnerTokenFromRequest(request));
+    if (!partner) return err("Invalid or missing partner token.", 401);
+    return handleConnectionRespond(request, env, partner, connRespondMatch[1]);
+  }
+  let disclosureMatch = pathname.match(/^\/api\/partner\/content-assignments\/([^/]+)\/disclosure$/);
+  if (disclosureMatch && method === "PATCH") {
+    const partner = await getPartnerByToken(env, partnerTokenFromRequest(request));
+    if (!partner) return err("Invalid or missing partner token.", 401);
+    return handleContentAssignmentDisclosureSet(request, env, partner, disclosureMatch[1]);
+  }
+return null;
 }
 
 async function handlePartnerOverview(env) {
@@ -1414,5 +1944,26 @@ function handleAdminPartnerRoutes(request, env, pathname, method) {
   if (pathname === "/api/admin/ai/alerts" && method === "GET") return handleAdminAlerts(env);
   m = pathname.match(/^\/api\/admin\/ai\/campaign-matches\/([^/]+)$/);
   if (m && method === "GET") return handleCampaignMatches(env, m[1]);
+
+  if (pathname === "/api/admin/setup-recommendation-schema" && method === "POST") return handleSetupRecommendationSchema(env);
+
+  if (pathname === "/api/admin/categories" && method === "GET") return handleCategoriesList(env, false);
+  if (pathname === "/api/admin/categories" && method === "POST") return handleCategoriesAdminCreate(request, env);
+  m = pathname.match(/^\/api\/admin\/categories\/([^/]+)$/);
+  if (m && method === "PATCH") return handleCategoriesAdminUpdate(request, env, m[1]);
+
+  m = pathname.match(/^\/api\/admin\/campaigns\/([^/]+)\/requirements$/);
+  if (m && method === "PATCH") return handleCampaignRequirementsUpdate(request, env, m[1]);
+  m = pathname.match(/^\/api\/admin\/campaigns\/([^/]+)\/recommended-creators$/);
+  if (m && method === "GET") return handleCampaignRecommendedCreators(env, m[1]);
+
+  if (pathname === "/api/admin/opportunity-applications" && method === "GET") {
+    const qUrl = new URL(request.url);
+    return handleOpportunityApplicationsAdminList(env, qUrl.searchParams.get("campaign_id"));
+  }
+  m = pathname.match(/^\/api\/admin\/opportunity-applications\/([^/]+)$/);
+  if (m && method === "PATCH") return handleOpportunityApplicationAdminUpdate(request, env, m[1]);
+
+  if (pathname === "/api/admin/connections" && method === "GET") return handleConnectionsAdminList(env);
 return null;
 }
