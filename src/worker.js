@@ -1704,7 +1704,6 @@ async function handlePartnerLevelsRecalculateAll(env) {
   return json({ ok: true, count: updates.length, updates: updates });
 }
 
-async 
 // ---------- AI Partner Manager / AI Matching / AI Alerts (rule-based, not real ML) ----------
 
 async function handlePartnerInsights(env) {
