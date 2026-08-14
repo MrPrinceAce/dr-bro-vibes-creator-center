@@ -1164,7 +1164,7 @@ async function handleConnectionCreate(request, env, partner) {
   return json({ connection: row }, 201);
 }
 
-async function handleConnectionsList(env, partner) {
+async function handleCreatorConnectionsList(env, partner) {
   const { results } = await env.DB.prepare(
     "SELECT cc.*, pa.name AS partner_a_name, pb.name AS partner_b_name FROM creator_connections cc JOIN partners pa ON pa.id = cc.partner_a_id JOIN partners pb ON pb.id = cc.partner_b_id WHERE cc.partner_a_id = ? OR cc.partner_b_id = ? ORDER BY cc.created_at DESC"
   ).bind(partner.id, partner.id).all();
@@ -1268,7 +1268,7 @@ async function handlePublicPartnerRoutes(request, env, pathname, method) {
   if (pathname === "/api/partner/connections" && method === "GET") {
     const partner = await getPartnerByToken(env, partnerTokenFromRequest(request));
     if (!partner) return err("Invalid or missing partner token.", 401);
-    return handleConnectionsList(env, partner);
+    return handleCreatorConnectionsList(env, partner);
   }
   let connRespondMatch = pathname.match(/^\/api\/partner\/connections\/([^/]+)$/);
   if (connRespondMatch && method === "PATCH") {
